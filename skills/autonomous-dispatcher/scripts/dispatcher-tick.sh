@@ -30,6 +30,45 @@ source "${SCRIPT_DIR}/lib-dispatch.sh"
 
 log() { echo "[dispatcher-tick] $(date -u +%H:%M:%S) $*"; }
 
+# Validate EXECUTION_BACKEND ONCE upfront, before any label transitions.
+# H1 (PR-9 review): if dispatch() returned 1 from inside a step body, the
+# step had already swapped the issue's label to in-progress and posted a
+# comment — leaving a stuck issue + burning retries every tick. Catching
+# the typo here aborts the tick before any side effect.
+case "${EXECUTION_BACKEND:-local}" in
+  local|remote-aws-ssm) ;;
+  *)
+    echo "[dispatcher-tick] FATAL: unknown EXECUTION_BACKEND='${EXECUTION_BACKEND}'. Allowed: local, remote-aws-ssm." >&2
+    exit 1
+    ;;
+esac
+
+# dispatch — route a wrapper-spawn request to the configured backend (#62 axis 2).
+# Backends today: "local" (default — same-box dispatch-local.sh) and
+# "remote-aws-ssm" (sends an `aws ssm send-command` to a remote dev box).
+# Other backends (k8s, gha-runner) can be added with one case arm here.
+# The unknown-backend case is unreachable because we validate above; the
+# `*)` arm is a defensive assertion in case allowed-list values get out of
+# sync between the upfront check and the runtime dispatch.
+#
+# Args: <type> <issue_num> [session_id]   — passed through verbatim.
+dispatch() {
+  case "${EXECUTION_BACKEND:-local}" in
+    local)
+      bash "$PROJECT_DIR/scripts/dispatch-local.sh" "$@"
+      ;;
+    remote-aws-ssm)
+      bash "$SCRIPT_DIR/dispatch-remote-aws-ssm.sh" "$@"
+      ;;
+    *)
+      # Should never reach here because of the upfront check, but be loud
+      # if invariants drift.
+      echo "[dispatcher-tick] BUG: dispatch() reached unknown EXECUTION_BACKEND='${EXECUTION_BACKEND}' at runtime" >&2
+      exit 1
+      ;;
+  esac
+}
+
 # Tick-local state. JUST_DISPATCHED holds issue numbers dispatched in
 # Steps 2/3/4 of this tick, so Step 5 can skip them ([INV-09]).
 JUST_DISPATCHED=()
@@ -69,7 +108,7 @@ for i in $(seq 0 $((new_count - 1))); do
   label_swap "$issue_num" "" "in-progress"
   gh issue comment "$issue_num" --repo "$REPO" \
     --body "Dispatching autonomous development..."
-  bash "$PROJECT_DIR/scripts/dispatch-local.sh" dev-new "$issue_num"
+  dispatch dev-new "$issue_num"
   JUST_DISPATCHED+=("$issue_num")
 done
 
@@ -94,7 +133,7 @@ for i in $(seq 0 $((pr_count - 1))); do
   label_swap "$issue_num" "pending-review" "reviewing"
   gh issue comment "$issue_num" --repo "$REPO" \
     --body "Dispatching autonomous review..."
-  bash "$PROJECT_DIR/scripts/dispatch-local.sh" review "$issue_num"
+  dispatch review "$issue_num"
   JUST_DISPATCHED+=("$issue_num")
 done
 
@@ -149,7 +188,7 @@ for i in $(seq 0 $((pd_count - 1))); do
   label_swap "$issue_num" "pending-dev" "in-progress"
   gh issue comment "$issue_num" --repo "$REPO" \
     --body "Resuming development (session: ${session_id})..."
-  bash "$PROJECT_DIR/scripts/dispatch-local.sh" dev-resume "$issue_num" "$session_id"
+  dispatch dev-resume "$issue_num" "$session_id"
   JUST_DISPATCHED+=("$issue_num")
 done
 
