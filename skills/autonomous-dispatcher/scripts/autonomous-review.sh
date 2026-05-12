@@ -76,6 +76,12 @@ fi
 # Ensure we're in the project directory (needed when called directly, not just via SSM)
 cd "$PROJECT_DIR" || { echo "Error: cannot cd to $PROJECT_DIR" >&2; exit 1; }
 
+# Bot identity for downstream telemetry / cost attribution.
+# Picked up by AGENT_LAUNCHER (e.g. user's `cc` shell function) when set;
+# harmless extra env when AGENT_LAUNCHER is empty.
+export CC_USER="${CC_USER:-autonomous-review-bot}"
+export CC_ROLE_KIND="${CC_ROLE_KIND:-review}"
+
 LOG_FILE="/tmp/agent-${PROJECT_ID}-review-${ISSUE_NUMBER}.log"
 # PID file lives in the per-user PID dir (closes #72). pid_dir_for_project
 # is in lib-config.sh, sourced transitively via lib-agent.sh.
@@ -217,6 +223,34 @@ PR_HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid -q '.head
 log "PR branch: ${PR_BRANCH:-UNKNOWN} (HEAD: ${PR_HEAD_SHA:0:7})"
 
 SESSION_ID=$(uuidgen)
+
+# Verdict-detection bindings: actor + time window + body-trailer
+# presence. Replaces the prior session-id-only binding (which depended
+# on the agent echoing the wrapper's UUID verbatim).
+#
+# WRAPPER_START_TS — ISO-8601 UTC captured BEFORE run_agent. Verdict
+# comments older than this are stale (prior tick) and ignored.
+WRAPPER_START_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# BOT_LOGIN — the bot identity this wrapper authenticates as. We need
+# the diagnostic on failure (token expired, GH App perms reduced, rate
+# limit, etc.) so the operator can debug, but we deliberately limit
+# what we log: a 200-char head of stderr only, no full body. `gh api`
+# stderr is a JSON error body which is generally safe to log, but
+# truncation is defense-in-depth against a future gh release that
+# might surface request-context headers.
+_bot_login_raw=$(gh api user --jq '.login' 2>&1) && BOT_LOGIN="$_bot_login_raw" || {
+  log "WARNING: gh api user failed; verdict detector falling back to session-id binding. stderr (truncated): ${_bot_login_raw:0:200}"
+  BOT_LOGIN=""
+}
+# A literal "null" string can come back from `--jq '.login'` if /user
+# returns null (rare App-token misconfig). Treat as failure.
+if [[ "$BOT_LOGIN" == "null" || -z "$BOT_LOGIN" ]]; then
+  [[ "$BOT_LOGIN" == "null" ]] && log "WARNING: gh api user returned null login; falling back to session-id binding"
+  BOT_LOGIN=""
+fi
+if [[ -n "$BOT_LOGIN" ]]; then
+  log "Verdict will bind to actor=${BOT_LOGIN}, createdAt >= ${WRAPPER_START_TS}, body must contain 'Review Session'"
+fi
 
 PROMPT="$(cat <<EOF
 You are reviewing PR #${PR_NUMBER} for issue #${ISSUE_NUMBER} in the ${REPO} project.
@@ -473,21 +507,63 @@ log "Review agent exited with code: $AGENT_EXIT"
 # ---------------------------------------------------------------------------
 log "Parsing review result from issue comments..."
 
-# Poll for the agent's review comment. The polling regex (closes #95)
-# accepts the canonical phrasings ("Review PASSED" / "Review findings:")
-# AND common drift patterns: APPROVED FOR MERGE, Review APPROVED, LGTM,
-# Review FAILED, Review REJECTED, Changes requested. The pass-vs-fail
-# decision is made below by the classification grep — the polling step
-# only narrows down to "this looks like a verdict comment".
+# Poll for the agent's review comment.
 #
-# Retry up to 6 times (30s total) to avoid race conditions with concurrent comments.
-# SECURITY: the session-id binding (`Review Session.*${SESSION_ID}`) is
-# kept intact — without it a stray third-party comment could spoof a verdict.
+# Pattern (closes #95): the verdict-keyword regex accepts canonical
+# phrasings ("Review PASSED" / "Review findings:") plus common drift
+# variants (APPROVED FOR MERGE, Review APPROVED, LGTM, Review FAILED,
+# Review REJECTED, Changes requested). The pass-vs-fail decision is
+# made below by the classification grep — this polling step only
+# narrows down to "this looks like a verdict comment".
+#
+# Authenticity binding: see the predicate construction below for the
+# three-layer rationale (actor + time window + body trailer).
+#
+# Why we no longer bind to the wrapper's specific session UUID: the
+# agent occasionally rewrites the Review Session UUID in its comment
+# body, so a strict body-text match would miss valid verdicts and the
+# wrapper would fall through to the no-verdict-found FAILED branch.
+# Actor and time window are observed by the wrapper itself and cannot
+# be rewritten by the agent.
+#
+# Fallback: if `gh api user` returned empty at startup (BOT_LOGIN unset),
+# keep the body-text match against the wrapper's session_id so a
+# transient auth/API blip at the top of the wrapper doesn't strip all
+# spoof protection.
+#
+# Retry up to 6 times (30s total) to avoid race conditions.
 LATEST_COMMENT=""
+_VERDICT_RE='Review PASSED|Review APPROVED|APPROVED FOR MERGE|LGTM|Review PASS|Review findings:|Review FAILED|Review REJECTED|Changes requested'
+# Build the authenticity predicate once. Three layers, all required:
+#
+#   (a) actor (BOT_LOGIN) — when known, gates on the bot identity. In
+#       GH_AUTH_MODE=app this is the review-app's distinct login, so a
+#       concurrent dev wrapper can't spoof. In GH_AUTH_MODE=token dev
+#       and review share an identity, so this layer alone is insufficient.
+#
+#   (b) time window (WRAPPER_START_TS) — gates on createdAt, isolating
+#       the current review run from stale comments left by a prior tick.
+#
+#   (c) "Review Session" body trailer — a literal substring the review
+#       agent's prompt instructs it to emit. Does NOT bind to the
+#       wrapper's specific UUID (the prior brittleness this PR removes),
+#       only to the trailer's presence. This excludes the dev agent's status
+#       comments that happen to contain "Review findings" / "LGTM"
+#       inside a quoted prior verdict — those won't have the trailer.
+#
+# Fallback (BOT_LOGIN empty): drop (a), keep (b) and (c). The session-id
+# is included in (c)'s match for additional narrowing when actor is
+# unavailable.
+if [[ -n "$BOT_LOGIN" ]]; then
+  _AUTH_PREDICATE="(.author.login == \"${BOT_LOGIN}\") and (.createdAt >= \"${WRAPPER_START_TS}\") and (.body | test(\"Review Session\"))"
+else
+  _AUTH_PREDICATE="(.createdAt >= \"${WRAPPER_START_TS}\") and (.body | test(\"Review Session.*${SESSION_ID}\"))"
+fi
+_VERDICT_JQ="[.comments[] | select(${_AUTH_PREDICATE} and (.body | test(\"${_VERDICT_RE}\"; \"i\")))] | last | .body"
 for _poll_attempt in $(seq 1 6); do
   sleep 5
   LATEST_COMMENT=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json comments \
-    -q "[.comments[] | select((.body | test(\"Review PASSED|Review APPROVED|APPROVED FOR MERGE|LGTM|Review PASS|Review findings:|Review FAILED|Review REJECTED|Changes requested\"; \"i\")) and (.body | test(\"Review Session.*${SESSION_ID}\")))] | last | .body" 2>/dev/null || true)
+    -q "$_VERDICT_JQ" 2>/dev/null || true)
   if [[ -n "$LATEST_COMMENT" ]]; then
     break
   fi

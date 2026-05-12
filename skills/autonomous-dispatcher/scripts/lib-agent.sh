@@ -44,6 +44,41 @@ AGENT_REVIEW_MODEL="${AGENT_REVIEW_MODEL:-sonnet}"
 AGENT_PERMISSION_MODE="${AGENT_PERMISSION_MODE:-auto}"
 KIRO_AGENT_NAME="${KIRO_AGENT_NAME:-autonomous-dev}"
 
+# AGENT_LAUNCHER — optional launcher prefix wrapped around every agent
+# invocation in run_agent / resume_agent (prepended inside _run_with_timeout
+# so a hung launcher is still bounded by AGENT_TIMEOUT). Empty by default.
+# See autonomous.conf.example for the operator-facing usage and rationale.
+#
+# We tokenize the launcher string into AGENT_LAUNCHER_ARGV[] once via `eval`
+# at load time. This trusts autonomous.conf (same trust level as the
+# wrapper itself) but fails loudly on a malformed value rather than
+# silently corrupting argv.
+AGENT_LAUNCHER="${AGENT_LAUNCHER:-}"
+declare -a AGENT_LAUNCHER_ARGV=()
+if [[ -n "$AGENT_LAUNCHER" ]]; then
+  # Preserve the original value for diagnostics — we clear AGENT_LAUNCHER
+  # on parse failure (belt-and-suspenders for future callers that source
+  # without `set -e`), so the error message must read from the snapshot.
+  _orig_launcher="$AGENT_LAUNCHER"
+  if ! eval "AGENT_LAUNCHER_ARGV=($AGENT_LAUNCHER)" 2>/dev/null; then
+    # Explicit reset: if a future caller sources this without `set -e`,
+    # the `return 1` is silently swallowed and we'd otherwise leave a
+    # half-tokenized array. Empty = safe degraded state.
+    AGENT_LAUNCHER=""
+    AGENT_LAUNCHER_ARGV=()
+    echo "[lib-agent] ERROR: AGENT_LAUNCHER failed to parse as a shell argv list. Value: ${_orig_launcher}" >&2
+    unset _orig_launcher
+    return 1 2>/dev/null || exit 1
+  fi
+  # `eval` succeeded but produced an empty array — almost certainly an
+  # operator typo (stray `;`, leading whitespace + comment). Warn so it
+  # doesn't silently degrade to "launcher-less" without a breadcrumb.
+  if [[ ${#AGENT_LAUNCHER_ARGV[@]} -eq 0 ]]; then
+    echo "[lib-agent] WARN: AGENT_LAUNCHER non-empty but tokenized to zero argv elements. Treating as unset. Value: ${_orig_launcher}" >&2
+  fi
+  unset _orig_launcher
+fi
+
 # Wall-clock cap on agent invocations (INV-13, closes #60).
 # Wraps run_agent / resume_agent in coreutils `timeout` so a hung CLI cannot
 # eat indefinite wall time (observed: claude --resume against a completed
@@ -64,15 +99,18 @@ if [[ -z "$_AGENT_TIMEOUT_CMD" ]]; then
 fi
 
 # _run_with_timeout — invoke "$@" under timeout if available, otherwise run
-# directly. --kill-after=30s escalates to SIGKILL if the agent ignores the
-# initial SIGTERM (some MCP children trap TERM and need the harder push).
+# directly. AGENT_LAUNCHER_ARGV (if set) is prepended to the command inside
+# the timeout boundary so a hung launcher is still killed.
+# --kill-after=30s escalates to SIGKILL if the agent ignores the initial
+# SIGTERM (some MCP children trap TERM and need the harder push).
 # --signal=TERM lets the agent flush any final SSE bytes before dying.
 # Exit codes: passthrough on normal exit; 124 on TERM-timeout; 137 on KILL.
 _run_with_timeout() {
   if [[ -n "$_AGENT_TIMEOUT_CMD" ]]; then
-    "$_AGENT_TIMEOUT_CMD" --kill-after=30s --signal=TERM "$AGENT_TIMEOUT" "$@"
+    "$_AGENT_TIMEOUT_CMD" --kill-after=30s --signal=TERM "$AGENT_TIMEOUT" \
+      "${AGENT_LAUNCHER_ARGV[@]}" "$@"
   else
-    "$@"
+    "${AGENT_LAUNCHER_ARGV[@]}" "$@"
   fi
 }
 
@@ -251,7 +289,7 @@ run_agent() {
 
   case "$AGENT_CMD" in
     claude)
-      # Unset CLAUDECODE to allow launching from within an existing session
+      # Unset CLAUDECODE to allow launching from within an existing session.
       _run_with_timeout env -u CLAUDECODE "$AGENT_CMD" --session-id "$session_id" \
         ${session_name:+--name "$session_name"} \
         --permission-mode "$AGENT_PERMISSION_MODE" \
