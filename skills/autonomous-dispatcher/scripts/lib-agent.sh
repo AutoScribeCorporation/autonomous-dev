@@ -449,6 +449,90 @@ _opencode_session_id() {
   printf '%s\n' "$sid"
 }
 
+# _agy_log_file <session_id>
+# _agy_conversation_file <session_id>
+#
+# Sidecar paths under pid_dir_for_project() for the agy branch
+# (Antigravity 2.0 CLI). agy mints conversation UUIDs internally and
+# exposes them only via the CLI log file (no JSON event stream on
+# stdout). We direct agy's log to a per-session path with --log-file,
+# then grep the UUID and persist it to a separate per-session file
+# for resume.
+#
+# Pattern mirrors _codex_thread_file / _opencode_session_file. Two
+# files instead of one because the log is mostly noise and is not
+# the canonical UUID store — only the sidecar is.
+_agy_log_file() {
+  local session_id="$1" pid_dir
+  pid_dir=$(pid_dir_for_project) || return 1
+  printf '%s/agy-log-%s.log\n' "$pid_dir" "$session_id"
+}
+
+_agy_conversation_file() {
+  local session_id="$1" pid_dir
+  pid_dir=$(pid_dir_for_project) || return 1
+  printf '%s/agy-conversation-%s\n' "$pid_dir" "$session_id"
+}
+
+# _agy_capture_conversation <session_id> <log_file>
+#
+# Best-effort capture per [INV-36]: grep the log_file for
+#   Print mode: conversation=<UUID>
+# and write the UUID to the sidecar. Always returns 0 — capture failure
+# (missing log, no match, unwritable sidecar, content fails UUID-shape
+# check) must not gate run_agent's exit code, because resume_agent
+# falls back to a fresh run when the sidecar is absent.
+#
+# CWE-59 defense via [[ -L ]] — same pattern as _codex_capture_thread.
+#
+# UUID shape: agy's print-mode logger emits canonical RFC-4122 form
+# (8-4-4-4-12 lowercase hex). Anchoring the capture regex to that
+# shape — instead of `[a-f0-9-]+` — refuses pathological strings like
+# `---` or single-char matches that a future log-format change might
+# produce, so we never write garbage that would later survive
+# _agy_conversation_id's read-side regex.
+_agy_capture_conversation() {
+  local session_id="$1" log_file="$2" conv_file uuid
+  conv_file=$(_agy_conversation_file "$session_id") || return 0
+  [[ -f "$log_file" ]] || return 0
+  uuid=$(grep -oE 'Print mode: conversation=[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' "$log_file" \
+    | head -1 | sed 's/.*=//')
+  [[ -n "$uuid" ]] || return 0
+  if [[ -L "$conv_file" ]]; then
+    echo "[lib-agent] WARN: $conv_file is a symlink; refusing to write." >&2
+    return 0
+  fi
+  # Trailing return 0: the printf may fail (read-only fs, full disk, etc.);
+  # INV-36 promises capture is best-effort, so swallow the rc.
+  printf '%s\n' "$uuid" > "$conv_file" || true
+  return 0
+}
+
+# _agy_conversation_id <session_id>
+#
+# Read the captured UUID. Missing sidecar returns rc 1 so resume_agent
+# can detect it and fall back to a fresh run_agent.
+_agy_conversation_id() {
+  local session_id="$1" conv_file uuid
+  conv_file=$(_agy_conversation_file "$session_id") || return 1
+  # Symlink-defense: refuse to read through a symlink (pid_dir is mode 0700,
+  # so this is defense-in-depth). Mirrors _codex_thread_id (CWE-59).
+  [[ -L "$conv_file" ]] && return 1
+  [[ -f "$conv_file" ]] || return 1
+  # `cat` (not `head -n1` like _codex_thread_id) is intentional: multi-line
+  # content fails the UUID-shape check below rather than silently passing
+  # line 1 — `head` would mask a partial-write corruption.
+  uuid=$(cat "$conv_file" 2>/dev/null)
+  # Format-validate against canonical RFC-4122 form (8-4-4-4-12 lowercase
+  # hex). Anything else (corrupted sidecar, partial write, attacker-planted
+  # content past the symlink check) returns missing — resume_agent falls
+  # back to a fresh run_agent. This is stricter than `[a-f0-9-]+` (which
+  # would accept "---" or "a") so a corrupted sidecar can't silently feed
+  # `agy --conversation <bogus>` and burn a dispatch cycle.
+  [[ "$uuid" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || return 1
+  printf '%s\n' "$uuid"
+}
+
 # Acquire PID guard: prevent duplicate instances for the same issue.
 # Checks for symlink attacks, running processes, then writes current PID.
 # Args: $1=pid_file, $2=label (e.g. "autonomous-dev"), $3=issue_number
@@ -624,6 +708,53 @@ run_agent() {
         | _opencode_capture_session "$session_id"
       return "${PIPESTATUS[1]}"
       ;;
+    agy)
+      # Antigravity 2.0 CLI (Google). agy mints conversation UUIDs
+      # internally and emits them only via the CLI log file (no JSON
+      # event stream). We direct the log to a per-session path with
+      # --log-file, then capture the UUID into a sidecar for resume.
+      # Pattern mirrors codex/opencode but with a grep-based capture
+      # channel. See docs/pipeline/agy-cli-support.md and INV-36.
+      #
+      # Structural flags (NOT operator-tunable, NOT in EXTRA_ARGS):
+      #   -p — headless print mode; reads prompt from stdin per INV-34.
+      #   --dangerously-skip-permissions — load-bearing in headless mode;
+      #     without it agy denies every tool call. Same role as kiro's
+      #     --trust-all-tools and gemini's --approval-mode yolo, but
+      #     hardcoded here (not in EXTRA_ARGS like those CLIs) because
+      #     every headless agy invocation requires it — there is no
+      #     valid agy config that runs headless without this flag.
+      #   --print-timeout "$AGENT_TIMEOUT" — agy's internal cap defaults
+      #     to 5m, far below AGENT_TIMEOUT (default 4h). Without override,
+      #     every wrapper would die in 5m regardless of the outer cap.
+      #   --log-file — only programmatic channel for the conversation
+      #     UUID; per-session path so concurrent issues do not race.
+      #
+      # `model` parameter is ignored — agy doesn't accept --model on the
+      # CLI. Configure model selection via ~/.gemini/antigravity-cli/
+      # settings.json. WARN once per process so operators learn to stop
+      # passing AGENT_DEV_MODEL.
+      if [[ -n "$model" && -z "${_LIB_AGENT_AGY_MODEL_WARNED:-}" ]]; then
+        echo "[lib-agent] WARN: AGENT_CMD=agy does not support --model flag; ignoring AGENT_DEV_MODEL=${model}. Configure model via ~/.gemini/antigravity-cli/settings.json instead." >&2
+        export _LIB_AGENT_AGY_MODEL_WARNED=1
+      fi
+
+      local agy_log
+      agy_log=$(_agy_log_file "$session_id") || return 1
+
+      printf '%s' "$prompt" \
+        | _run_with_timeout "$AGENT_CMD" \
+            -p \
+            --dangerously-skip-permissions \
+            --print-timeout "$AGENT_TIMEOUT" \
+            --log-file "$agy_log" \
+            "${extra_args[@]}"
+      local rc=$?
+
+      _agy_capture_conversation "$session_id" "$agy_log"
+
+      return $rc
+      ;;
     *)
       # Generic fallback: assume `<cli> -p` (with no value) reads from
       # stdin. The `-p` token is preserved so a downstream CLI that
@@ -751,6 +882,37 @@ resume_agent() {
         return "${PIPESTATUS[1]}"
       else
         echo "[lib-agent] no captured opencode sessionID for session $session_id; starting a new opencode session" >&2
+        run_agent "$session_id" "$prompt" "$model" "$session_name"
+      fi
+      ;;
+    agy)
+      # See run_agent agy branch for structural-flag rationale and
+      # sidecar mechanics. resume reads the captured UUID from the
+      # sidecar and feeds it back via --conversation <UUID>. If the
+      # sidecar is missing (run_agent never ran for this session, or
+      # capture failed per INV-36), fall back to a fresh run_agent —
+      # same defensive pattern as the codex / opencode branches.
+      local _agy_cid
+      if _agy_cid=$(_agy_conversation_id "$session_id"); then
+        local agy_log
+        agy_log=$(_agy_log_file "$session_id") || return 1
+        printf '%s' "$prompt" \
+          | _run_with_timeout "$AGENT_CMD" \
+              --conversation "$_agy_cid" \
+              -p \
+              --dangerously-skip-permissions \
+              --print-timeout "$AGENT_TIMEOUT" \
+              --log-file "$agy_log" \
+              "${extra_args[@]}"
+        local rc=$?
+        # Self-healing re-capture: under normal operation the UUID
+        # equals _agy_cid (agy keeps the id on resume), so this is a
+        # no-op overwrite. If a future agy version rotates IDs on
+        # resume, the sidecar tracks the live one without code change.
+        _agy_capture_conversation "$session_id" "$agy_log"
+        return $rc
+      else
+        echo "[lib-agent] no captured agy conversation_id for session $session_id; starting a new agy session" >&2
         run_agent "$session_id" "$prompt" "$model" "$session_name"
       fi
       ;;
