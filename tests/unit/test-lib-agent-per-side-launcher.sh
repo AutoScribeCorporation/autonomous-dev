@@ -164,18 +164,19 @@ assert_contains "guard returns rc=1 (source aborted)" "RC=1" "$out"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== PSL-S9: autonomous-dev.sh structural placement ==="
+echo "=== PSL-S9: autonomous-dev.sh — launcher rebind AFTER source lib-auth.sh ==="
 # ---------------------------------------------------------------------------
-# Match: source "${SCRIPT_DIR}/lib-agent.sh" followed (within 9 lines —
-# allows the existing 3-line WHY comment + AGENT_CMD rebind from PR #156
-# + the new 4-line WHY comment + the new AGENT_LAUNCHER_ARGV rebind) by
-# AGENT_LAUNCHER_ARGV=("${AGENT_DEV_LAUNCHER_ARGV[@]}").
+# Same invariant as INV-37 PSC-S9: the per-side rebind MUST come AFTER
+# `source lib-auth.sh` because lib-auth.sh transitively re-sources
+# autonomous.conf, which would otherwise reset AGENT_LAUNCHER (and
+# transitively AGENT_LAUNCHER_ARGV via lib-agent.sh's :- defaults if
+# the wrapper rebind happened before this re-source).
 hit=$(awk '
-  /source "\$\{SCRIPT_DIR\}\/lib-agent\.sh"/ {
-    found_source = NR
+  /source "\$\{SCRIPT_DIR\}\/lib-auth\.sh"/ {
+    found_lib_auth = NR
     next
   }
-  found_source && NR <= found_source + 9 {
+  found_lib_auth && NR > found_lib_auth {
     if ($0 ~ /^AGENT_LAUNCHER_ARGV=\("\$\{AGENT_DEV_LAUNCHER_ARGV\[@\]\}"\)/) {
       print "MATCH"
       exit
@@ -183,21 +184,36 @@ hit=$(awk '
   }
 ' "$DEV_WRAPPER")
 
-assert_eq "autonomous-dev.sh: AGENT_LAUNCHER_ARGV=(\${AGENT_DEV_LAUNCHER_ARGV[@]}) within 9 lines of source lib-agent.sh" \
+assert_eq "autonomous-dev.sh: launcher rebind lands AFTER source lib-auth.sh" \
   "MATCH" "$hit"
+
+# Symmetric pre-source check: assert the rebind does NOT appear before
+# source lib-auth.sh. Mirrors the dual check in PSC-S9. agy review on
+# PR #159 caught the missing pre-source assertion.
+hit_pre=$(awk '
+  /source "\$\{SCRIPT_DIR\}\/lib-auth\.sh"/ {
+    print "REACHED_LIB_AUTH"
+    exit
+  }
+  /^AGENT_LAUNCHER_ARGV=\("\$\{AGENT_DEV_LAUNCHER_ARGV\[@\]\}"\)/ {
+    print "REBIND_BEFORE_LIB_AUTH"
+    exit
+  }
+' "$DEV_WRAPPER")
+
+assert_eq "autonomous-dev.sh: launcher rebind does NOT precede source lib-auth.sh" \
+  "REACHED_LIB_AUTH" "$hit_pre"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== PSL-S10: autonomous-review.sh structural placement ==="
+echo "=== PSL-S10: autonomous-review.sh — launcher rebind AFTER source lib-auth.sh ==="
 # ---------------------------------------------------------------------------
-# Match: within 9 lines of source — 4-line WHY comment from PR #156 +
-# AGENT_CMD rebind + new 3-line WHY + new AGENT_LAUNCHER_ARGV rebind.
 hit=$(awk '
-  /source "\$\{SCRIPT_DIR\}\/lib-agent\.sh"/ {
-    found_source = NR
+  /source "\$\{SCRIPT_DIR\}\/lib-auth\.sh"/ {
+    found_lib_auth = NR
     next
   }
-  found_source && NR <= found_source + 9 {
+  found_lib_auth && NR > found_lib_auth {
     if ($0 ~ /^AGENT_LAUNCHER_ARGV=\("\$\{AGENT_REVIEW_LAUNCHER_ARGV\[@\]\}"\)/) {
       print "MATCH"
       exit
@@ -205,8 +221,22 @@ hit=$(awk '
   }
 ' "$REVIEW_WRAPPER")
 
-assert_eq "autonomous-review.sh: AGENT_LAUNCHER_ARGV=(\${AGENT_REVIEW_LAUNCHER_ARGV[@]}) within 9 lines of source lib-agent.sh" \
+assert_eq "autonomous-review.sh: launcher rebind lands AFTER source lib-auth.sh" \
   "MATCH" "$hit"
+
+hit_pre=$(awk '
+  /source "\$\{SCRIPT_DIR\}\/lib-auth\.sh"/ {
+    print "REACHED_LIB_AUTH"
+    exit
+  }
+  /^AGENT_LAUNCHER_ARGV=\("\$\{AGENT_REVIEW_LAUNCHER_ARGV\[@\]\}"\)/ {
+    print "REBIND_BEFORE_LIB_AUTH"
+    exit
+  }
+' "$REVIEW_WRAPPER")
+
+assert_eq "autonomous-review.sh: launcher rebind does NOT precede source lib-auth.sh" \
+  "REACHED_LIB_AUTH" "$hit_pre"
 
 echo ""
 echo "PASS: $PASS    FAIL: $FAIL"
