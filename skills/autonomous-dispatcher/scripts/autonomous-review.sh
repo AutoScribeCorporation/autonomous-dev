@@ -68,19 +68,114 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# E2E config validation (issue #161)
+#
+# E2E_MODE accepts: none (default), browser (existing), command (new).
+# E2E_ENABLED=true requires E2E_MODE to be set explicitly — projects must
+# opt into a specific mode rather than implicitly inheriting "browser".
+# ---------------------------------------------------------------------------
+validate_e2e_config() {
+  local mode="${E2E_MODE:-none}"
+
+  # E2E_ENABLED=true with no mode set is the most common upgrade footgun:
+  # projects that were on the old wrapper had only E2E_ENABLED. Fail loud
+  # with the three accepted values listed.
+  if [[ "${E2E_ENABLED:-false}" == "true" ]] && [[ -z "${E2E_MODE:-}" ]]; then
+    echo "Error: E2E_ENABLED=true requires E2E_MODE to be set explicitly." >&2
+    echo "  Accepted values for E2E_MODE: none, browser, command" >&2
+    echo "  - none:    no E2E section in review prompt (equivalent to E2E_ENABLED=false)" >&2
+    echo "  - browser: existing Chrome DevTools MCP UI smoke test (set E2E_PREVIEW_URL_PATTERN, E2E_TEST_USER_EMAIL, E2E_TEST_USER_PASSWORD)" >&2
+    echo "  - command: project-supplied command for backend / CLI / pipeline projects (set E2E_COMMAND, E2E_COMMAND_EVIDENCE_PARSER)" >&2
+    return 1
+  fi
+
+  case "$mode" in
+    none|browser)
+      # In the non-command modes the command-mode fields must NOT be
+      # set. Catches the "operator filled in E2E_COMMAND but forgot to
+      # set E2E_MODE=command" footgun — without this guard the fields
+      # would be silently ignored and the operator would think
+      # command-mode was wired up.
+      if [[ -n "${E2E_COMMAND:-}" || -n "${E2E_COMMAND_EVIDENCE_PARSER:-}" || -n "${E2E_COMMAND_PRE_HOOKS:-}" ]]; then
+        echo "Error: E2E_COMMAND* fields are set but E2E_MODE='${mode}', not 'command'." >&2
+        echo "  Either set E2E_MODE=command or unset E2E_COMMAND / E2E_COMMAND_PRE_HOOKS / E2E_COMMAND_EVIDENCE_PARSER." >&2
+        return 1
+      fi
+      ;;
+    command)
+      if [[ -z "${E2E_COMMAND:-}" ]]; then
+        echo "Error: E2E_MODE=command requires E2E_COMMAND to be set." >&2
+        echo "  Example: E2E_COMMAND='bash scripts/e2e-pr-stage.sh \${PR_NUMBER}'" >&2
+        return 1
+      fi
+      if [[ -z "${E2E_COMMAND_EVIDENCE_PARSER:-}" ]]; then
+        echo "Error: E2E_MODE=command requires E2E_COMMAND_EVIDENCE_PARSER to be set." >&2
+        echo "  The parser MUST output a markdown evidence block ending with the" >&2
+        echo "  literal marker: <!-- e2e-evidence: complete sha=\"<HEAD>\" -->" >&2
+        echo "  See references/e2e-command-mode.md for the contract." >&2
+        return 1
+      fi
+      # Reject unbraced $PR_NUMBER in command-mode fields. The wrapper only
+      # substitutes the BRACED form ${PR_NUMBER}; a bare $PR_NUMBER would
+      # silently render as empty (PR_NUMBER is not exported), potentially
+      # targeting the wrong stage or the prod stage. This guard catches
+      # the typo at config-validation time. Match \$PR_NUMBER NOT followed
+      # by '{' or alphanum (so we don't false-fire on `${PR_NUMBER}` or
+      # `$PR_NUMBER_FOO`).
+      for _field in E2E_COMMAND E2E_COMMAND_PRE_HOOKS E2E_COMMAND_EVIDENCE_PARSER; do
+        local _value="${!_field:-}"
+        if [[ "$_value" =~ \$PR_NUMBER([^A-Za-z0-9_{]|$) ]]; then
+          echo "Error: ${_field} contains unbraced \$PR_NUMBER." >&2
+          echo "  Use \${PR_NUMBER} (with braces) so the wrapper can substitute it." >&2
+          echo "  Found in: ${_field}=${_value}" >&2
+          return 1
+        fi
+      done
+      ;;
+    *)
+      echo "Error: invalid E2E_MODE='${mode}'." >&2
+      echo "  Accepted values for E2E_MODE: none, browser, command" >&2
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+validate_e2e_config || exit 1
+
+# Derived flag: true when E2E_MODE is one of {browser, command}. Used by
+# downstream blocks that need to know whether E2E is producing output
+# (for the decision-gate language and env-var export). The legacy
+# E2E_ENABLED toggle is preserved for back-compat in autonomous.conf
+# but the wrapper internally drives off E2E_MODE — that's the source
+# of truth.
+case "${E2E_MODE:-none}" in
+  browser|command) E2E_ACTIVE="true" ;;
+  *)               E2E_ACTIVE="false" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 ISSUE_NUMBER=""
+VALIDATE_CONFIG_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --issue)
       [[ $# -ge 2 ]] || { echo "Error: --issue requires argument" >&2; exit 1; }
       ISSUE_NUMBER="$2"; shift 2 ;;
+    --validate-config-only)
+      # Exit cleanly after config validation; used by tests/unit/test-e2e-mode-command.sh.
+      VALIDATE_CONFIG_ONLY=1; shift ;;
     *)
       echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+
+if [[ "$VALIDATE_CONFIG_ONLY" -eq 1 ]]; then
+  exit 0
+fi
 
 if [[ -z "$ISSUE_NUMBER" ]]; then
   echo "Usage: $0 --issue <number>" >&2
@@ -237,7 +332,7 @@ log "Found PR #${PR_NUMBER} for issue #${ISSUE_NUMBER}"
 # ---------------------------------------------------------------------------
 PREVIEW_URL=""
 
-if [[ "${E2E_ENABLED:-false}" == "true" && -n "${E2E_PREVIEW_URL_PATTERN:-}" ]]; then
+if [[ "${E2E_ACTIVE:-false}" == "true" && -n "${E2E_PREVIEW_URL_PATTERN:-}" ]]; then
   log "Extracting preview URL for PR #${PR_NUMBER}..."
 
   # Build expected URL from config, replacing {N} with PR number
@@ -266,7 +361,7 @@ if [[ "${E2E_SCREENSHOT_UPLOAD:-false}" == "true" && -x "${PROJECT_DIR}/skills/a
   log "Screenshot upload script available"
 else
   SCREENSHOT_UPLOAD_AVAILABLE="false"
-  if [[ "${E2E_ENABLED:-false}" == "true" ]]; then
+  if [[ "${E2E_ACTIVE:-false}" == "true" ]]; then
     log "WARNING: Screenshot upload not available (set E2E_SCREENSHOT_UPLOAD=true and ensure upload-screenshot.sh is executable)"
   fi
 fi
@@ -306,6 +401,33 @@ if [[ "$BOT_LOGIN" == "null" || -z "$BOT_LOGIN" ]]; then
 fi
 if [[ -n "$BOT_LOGIN" ]]; then
   log "Verdict will bind to actor=${BOT_LOGIN}, createdAt >= ${WRAPPER_START_TS}, body must contain 'Review Session'"
+fi
+
+# E2E_MODE=command: substitute the literal `${PR_NUMBER}` placeholder in
+# command-mode fields so the agent receives a fully-resolved command
+# string. Operators write the placeholder in autonomous.conf with single
+# quotes to defer expansion (e.g.
+# E2E_COMMAND='bash scripts/e2e.sh pr-${PR_NUMBER}').
+#
+# `:-` defaults are required: under `set -u`, `${VAR//pat/repl}` against
+# an unset VAR aborts the wrapper. E2E_COMMAND_PRE_HOOKS is documented
+# as optional; without the default an operator who simply omits the
+# line crashes the wrapper before the agent ever runs.
+E2E_COMMAND_RENDERED=""
+E2E_COMMAND_PRE_HOOKS_RENDERED=""
+E2E_COMMAND_EVIDENCE_PARSER_RENDERED=""
+if [[ "${E2E_MODE:-none}" == "command" ]]; then
+  if [[ -z "$PR_NUMBER" ]]; then
+    log "ERROR: E2E_MODE=command but PR_NUMBER is empty — refusing to render"
+    log "       a placeholder-substituted command that would target the wrong PR."
+    exit 1
+  fi
+  E2E_COMMAND_RENDERED="${E2E_COMMAND:-}"
+  E2E_COMMAND_RENDERED="${E2E_COMMAND_RENDERED//\$\{PR_NUMBER\}/${PR_NUMBER}}"
+  E2E_COMMAND_PRE_HOOKS_RENDERED="${E2E_COMMAND_PRE_HOOKS:-}"
+  E2E_COMMAND_PRE_HOOKS_RENDERED="${E2E_COMMAND_PRE_HOOKS_RENDERED//\$\{PR_NUMBER\}/${PR_NUMBER}}"
+  E2E_COMMAND_EVIDENCE_PARSER_RENDERED="${E2E_COMMAND_EVIDENCE_PARSER:-}"
+  E2E_COMMAND_EVIDENCE_PARSER_RENDERED="${E2E_COMMAND_EVIDENCE_PARSER_RENDERED//\$\{PR_NUMBER\}/${PR_NUMBER}}"
 fi
 
 PROMPT="$(cat <<EOF
@@ -398,7 +520,12 @@ Read the issue body for an \`## Acceptance Criteria\` section. For EACH criterio
 
 $(render_bot_review_section "$REVIEW_BOTS_VALIDATED" "$PR_NUMBER" "$REPO")
 
-$(if [[ "${E2E_ENABLED:-false}" == "true" ]]; then cat <<E2E_BLOCK
+$(case "${E2E_MODE:-none}" in
+  none)
+    : # no E2E section
+    ;;
+  browser)
+    cat <<E2E_BLOCK
 ## E2E Verification via Chrome DevTools MCP — MANDATORY
 
 **This section is NON-NEGOTIABLE. You MUST perform E2E verification using Chrome DevTools MCP.**
@@ -504,7 +631,149 @@ else
 fi)
 \`\`\`
 E2E_BLOCK
-fi)
+    ;;
+  command)
+    cat <<COMMAND_E2E_BLOCK
+## E2E Verification via project command — MANDATORY
+
+**This section is NON-NEGOTIABLE. You MUST run the project-supplied verify command and validate its evidence output.**
+
+This project does not have a browser-driven UI E2E. Instead the project
+defines its own verify command (typical for backend pipelines, CLI tools,
+infra-as-code, or ML pipelines). Your job is: invoke the command, wait
+for it to finish (or timeout), validate the evidence block it produces,
+and post the evidence as a PR comment.
+
+### Configuration (resolved by the wrapper)
+
+- Verify command: \`${E2E_COMMAND_RENDERED}\`
+- Pre-hooks: \`${E2E_COMMAND_PRE_HOOKS_RENDERED:-(none)}\`
+- Evidence parser: \`${E2E_COMMAND_EVIDENCE_PARSER_RENDERED}\`
+- Timeout (seconds): ${E2E_COMMAND_TIMEOUT_SECONDS:-3600}
+
+### Step 1: Run pre-hooks (if configured)
+
+If "Pre-hooks" above is not "(none)", run that command first. A non-zero
+exit code from pre-hooks aborts the E2E with status FAIL.
+
+\`\`\`bash
+${E2E_COMMAND_PRE_HOOKS_RENDERED:-:}
+\`\`\`
+
+Pre-hooks typically prepare per-PR test data (e.g. seed a DDB row,
+provision a sandbox project, deploy a preview stack).
+
+### Step 2: Run the verify command
+
+\`\`\`bash
+timeout ${E2E_COMMAND_TIMEOUT_SECONDS:-3600} \
+  ${E2E_COMMAND_RENDERED} \
+  > /tmp/e2e-${PR_NUMBER}.log 2>&1
+EXIT_CODE=\$?
+\`\`\`
+
+Stream output to a log file so you can analyze partial results on timeout.
+\`EXIT_CODE=124\` from \`timeout\` means the command was killed for exceeding
+the deadline — treat as FAIL but still parse partial evidence below.
+
+### Step 3: Inspect outcome
+
+- **EXIT_CODE=0** → PASS pending evidence validation. **Proceed to Step 4.**
+- **EXIT_CODE=124** → TIMEOUT. Some pipelines write artifacts BEFORE a
+  late-stage cleanup races and triggers timeout. **Proceed to Step 4** to
+  let the evidence parser inspect the authoritative artifact source
+  (S3 / DDB / file). The parser, not the exit code, is the source of
+  truth for whether the artifact is acceptable.
+- **EXIT_CODE!=0 and !=124** → FAIL. **SKIP Step 4 (do NOT run the
+  parser — its input log is malformed).** Jump directly to Step 5 with
+  a log tail as evidence.
+
+### Step 4: Generate evidence block via parser (ONLY if EXIT_CODE ∈ {0, 124})
+
+\`\`\`bash
+if [[ \$EXIT_CODE -eq 0 || \$EXIT_CODE -eq 124 ]]; then
+  EVIDENCE=\$(${E2E_COMMAND_EVIDENCE_PARSER_RENDERED} /tmp/e2e-${PR_NUMBER}.log)
+fi
+\`\`\`
+
+The parser MUST output a markdown evidence block ending with the literal
+marker (note the embedded SHA — see Step 4b):
+
+\`\`\`
+<!-- e2e-evidence: complete sha="${PR_HEAD_SHA}" -->
+\`\`\`
+
+If the parser exits non-zero or the marker is missing, the evidence is
+malformed — post a "Review findings" comment naming
+\`E2E_COMMAND_EVIDENCE_PARSER\` as the subsystem at fault and exit.
+
+### Step 4b: Stale-evidence guard — REQUIRED on every tick
+
+**Before running the verify command at all**, check whether the PR
+already has a valid evidence comment for the current HEAD SHA. The
+current HEAD SHA is \`${PR_HEAD_SHA}\`. The marker is considered
+"matching" only if it contains exactly \`sha="${PR_HEAD_SHA}"\` —
+plain marker matches do NOT count (would let stale evidence from a
+prior commit pass).
+
+\`\`\`bash
+# Use jq to fetch the FULL comment body (not just the marker line) so
+# Step 6 can evaluate AC coverage against the existing evidence's table.
+EVIDENCE=\$(gh pr view ${PR_NUMBER} --repo ${REPO} --json comments \\
+  --jq '.comments[] | select(.body | contains("e2e-evidence: complete sha=\\"${PR_HEAD_SHA}\\"")) | .body' \\
+  | head -1)
+if [[ -n "\$EVIDENCE" ]]; then
+  echo "Evidence already exists for HEAD ${PR_HEAD_SHA}, skipping E2E re-run"
+  # \$EVIDENCE now holds the full markdown comment body. Jump to Step 6
+  # PASS/FAIL decision based on its contents (AC table coverage).
+fi
+\`\`\`
+
+If the existing comment's marker SHA does NOT match \`${PR_HEAD_SHA}\`,
+the evidence is stale — re-run E2E from Step 1.
+
+### Step 5: Post evidence as a PR comment
+
+For PASS or TIMEOUT (EXIT_CODE ∈ {0, 124}):
+
+\`\`\`bash
+gh pr comment ${PR_NUMBER} --body "\$EVIDENCE"
+\`\`\`
+
+For other failures (EXIT_CODE not in {0, 124}), post a log-tail comment
+instead — do NOT invoke the parser:
+
+\`\`\`bash
+gh pr comment ${PR_NUMBER} --body "\$(cat <<EOF_FAIL
+## E2E Failure (verify command exit code: \$EXIT_CODE)
+
+Command: \\\`${E2E_COMMAND_RENDERED}\\\`
+
+Last 50 lines of /tmp/e2e-${PR_NUMBER}.log:
+\\\`\\\`\\\`
+\$(tail -50 /tmp/e2e-${PR_NUMBER}.log)
+\\\`\\\`\\\`
+EOF_FAIL
+)"
+\`\`\`
+
+### Step 6: Decide PASS / FAIL
+
+PASS when **all** of:
+- Pre-hooks (if configured) exited 0
+- Verify command exited 0 (or 124 with the artifact-recovery exception above)
+- Evidence block ends with the SHA-bound marker \`<!-- e2e-evidence: complete sha="${PR_HEAD_SHA}" -->\`
+- Every issue-body acceptance criterion that names a verifiable artifact
+  (file path, S3 key, DDB row state, log line, count) is satisfied by
+  the evidence block
+
+FAIL when any of those conditions is not met. Include the relevant log
+tail in your findings.
+
+For the full contract, consult \`references/e2e-command-mode.md\`.
+COMMAND_E2E_BLOCK
+    ;;
+esac)
 
 ## Decision
 After thorough review:
@@ -517,25 +786,26 @@ the FAILED branch and the dispatcher will eventually mark the issue
 shown below — alternative phrasings like "APPROVED FOR MERGE" or "LGTM"
 also work, but stick to the canonical form when possible.
 
-- If ALL checklist items pass AND code quality is good$(if [[ "${E2E_ENABLED:-false}" == "true" ]]; then echo " AND all E2E tests pass"; fi) AND no requirement drift detected:
+- If ALL checklist items pass AND code quality is good$(if [[ "${E2E_ACTIVE:-false}" == "true" ]]; then echo " AND all E2E tests pass"; fi) AND no requirement drift detected:
   Post a comment on issue #${ISSUE_NUMBER} starting with the exact text
   **\`Review PASSED\`** on the FIRST LINE, like:
 
-  > Review PASSED - All checklist items verified, code quality good.$(if [[ "${E2E_ENABLED:-false}" == "true" ]]; then echo " E2E verification completed."; fi) No requirement drift.
+  > Review PASSED - All checklist items verified, code quality good.$(if [[ "${E2E_ACTIVE:-false}" == "true" ]]; then echo " E2E verification completed."; fi) No requirement drift.
   > Review Session: \`${SESSION_ID}\`
 
   Then exit.
 
-- If ANY item fails$(if [[ "${E2E_ENABLED:-false}" == "true" ]]; then echo " OR any E2E test fails OR preview URL is unavailable"; fi) OR requirement drift is detected:
+- If ANY item fails$(case "${E2E_MODE:-none}" in browser) echo " OR any E2E test fails OR preview URL is unavailable" ;; command) echo " OR the verify command fails OR the evidence block is missing/malformed" ;; esac) OR requirement drift is detected:
   Post a comment on issue #${ISSUE_NUMBER} starting with the exact text
   **\`Review findings:\`** on the FIRST LINE, followed by a numbered list
-  of each failing item with specific remediation instructions.$(if [[ "${E2E_ENABLED:-false}" == "true" ]]; then echo "
-  Include E2E failure details with screenshot evidence."; fi)
+  of each failing item with specific remediation instructions.$(case "${E2E_MODE:-none}" in browser) echo "
+  Include E2E failure details with screenshot evidence." ;; command) echo "
+  Include the verify-command exit code and a tail of /tmp/e2e-${PR_NUMBER}.log as evidence." ;; esac)
   End the comment with: \`Review Session: \\\`${SESSION_ID}\\\`\`
   Then exit.
 
 IMPORTANT: Work autonomously. Be thorough but fair. Focus on correctness and compliance.
-$(if [[ "${E2E_ENABLED:-false}" == "true" ]]; then echo "E2E verification is MANDATORY — do NOT skip it, do NOT treat it as optional."; fi)
+$(if [[ "${E2E_ACTIVE:-false}" == "true" ]]; then echo "E2E verification is MANDATORY — do NOT skip it, do NOT treat it as optional."; fi)
 EOF
 )"
 
@@ -546,9 +816,21 @@ SESSION_NAME="review-pr-${PR_NUMBER}-issue-${ISSUE_NUMBER}"
 log "Starting review session: ${SESSION_ID} (name: ${SESSION_NAME}, model: ${AGENT_REVIEW_MODEL:-sonnet})"
 
 # Export E2E credentials as env vars (not in prompt) for agent to read at runtime
-if [[ "${E2E_ENABLED:-false}" == "true" ]]; then
+if [[ "${E2E_ACTIVE:-false}" == "true" ]]; then
   export E2E_TEST_USER_EMAIL="${E2E_TEST_USER_EMAIL:-}"
   export E2E_TEST_USER_PASSWORD="${E2E_TEST_USER_PASSWORD:-}"
+fi
+
+# Command-mode: export PR_NUMBER and PR_HEAD_SHA so the project's
+# E2E_COMMAND / parser scripts can read them. This is required by the
+# evidence-block contract (parser must embed PR_HEAD_SHA in the marker
+# for stale-evidence guard) and convenient for verify commands that use
+# the unbraced shell form `$PR_NUMBER` after a future opt-in. Today
+# unbraced is rejected at config-validation time, but parsers commonly
+# read these.
+if [[ "${E2E_MODE:-none}" == "command" ]]; then
+  export PR_NUMBER="${PR_NUMBER}"
+  export PR_HEAD_SHA="${PR_HEAD_SHA:-}"
 fi
 
 set +e
@@ -693,7 +975,7 @@ if [[ "$PASSED_VERDICT" == "true" ]]; then
   fi
   log "Submitting PR approval for PR #${PR_NUMBER}..."
   if gh pr review "$PR_NUMBER" --repo "$REPO" --approve \
-    --body "All acceptance criteria verified.$(if [[ "${E2E_ENABLED:-false}" == "true" ]]; then echo " E2E verification passed."; fi)" 2>&1; then
+    --body "All acceptance criteria verified.$(if [[ "${E2E_ACTIVE:-false}" == "true" ]]; then echo " E2E verification passed."; fi)" 2>&1; then
     log "PR #${PR_NUMBER} approved successfully."
   else
     log "ERROR: Failed to submit PR approval for PR #${PR_NUMBER}."
