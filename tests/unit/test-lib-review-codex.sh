@@ -31,6 +31,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LIB="$PROJECT_ROOT/skills/autonomous-dispatcher/scripts/lib-review-codex.sh"
 WRAPPER="$PROJECT_ROOT/skills/autonomous-dispatcher/scripts/autonomous-review.sh"
 CI="$PROJECT_ROOT/.github/workflows/ci.yml"
+FIXTURES="$SCRIPT_DIR/fixtures"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -94,6 +95,29 @@ VERDICT_TURN='{"type":"turn.started"}
 {"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"Review PASSED"}}
 {"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":900}}'
 
+# A turn that emits agent_message items that are PROGRESS NARRATION only — no
+# verdict trailer (`Review PASSED` / `Review findings:` / `Review Agent: codex`).
+# This is the #198 root-cause-2 shape: the pre-fix detector (which matched ANY
+# agent_message) false-converged on this; the verdict-trailer detector must treat
+# it as gather-only (rc 1) so the loop RESUMES.
+NARRATION_TURN='{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"n0","type":"command_execution","command":"gh pr view 197 --json mergeable","aggregated_output":"MERGEABLE"}}
+{"type":"item.completed","item":{"id":"n1","type":"agent_message","text":"Next I'\''m reading the workflow instructions to understand the checklist."}}
+{"type":"item.completed","item":{"id":"n2","type":"agent_message","text":"I'\''ll verify the PR reflects both changes."}}
+{"type":"turn.completed","usage":{"input_tokens":138668,"output_tokens":746}}'
+
+# A FAIL verdict turn: agent_message text begins with the fail-side trailer.
+FAIL_VERDICT_TURN='{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"f0","type":"tool_call","name":"shell"}}
+{"type":"item.completed","item":{"id":"f1","type":"agent_message","text":"Review findings:\n1. [BLOCKING] missing test coverage.\nReview Agent: codex"}}
+{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":400}}'
+
+# A turn whose only verdict signal is the `Review Agent: codex` discriminator
+# trailer (the resume prompt forces codex to emit this) — must converge.
+AGENT_TRAILER_TURN='{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"a0","type":"agent_message","text":"Review PASS - looks good.\nReview Session: `sid`\nReview Agent: codex"}}
+{"type":"turn.completed","usage":{"input_tokens":3000,"output_tokens":120}}'
+
 # ---------------------------------------------------------------------------
 echo "=== TC-CXR-DET: _codex_log_has_verdict_message ==="
 # ---------------------------------------------------------------------------
@@ -149,6 +173,54 @@ _codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-07 killed-mid-ms
   echo '{"type":"item.completed","item":{"type":"tool_call","name":"shell","output":"grep hit: \"type\":\"agent_message\" in transcript"}}'
   echo '{"type":"turn.completed","usage":{"input_tokens":5000}}'; } > "$TMPLOG"
 _codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-08 tool-output substring not a false verdict → rc 1" 1 "$?"
+
+# TC-CXR-DET-09 — #198 ROOT CAUSE 2: the last completed turn emits agent_message
+# items that are PURE PROGRESS NARRATION (no verdict trailer). Convergence must
+# mean "codex posted the VERDICT", NOT "codex emitted any assistant message" —
+# so this is gather-only (rc 1) and the loop RESUMES. The pre-fix detector
+# (any-agent_message) returned rc 0 here and false-converged → no resume → the
+# poller found no verdict → codex dropped `unavailable`.
+{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$NARRATION_TURN"; } > "$TMPLOG"
+_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-09 narration-only turn (no verdict trailer) → rc 1 (resumes)" 1 "$?"
+
+# TC-CXR-DET-09b — the SAME shape from a captured real-world review-193 fixture
+# (sanitized; the issue mandates a committed fixture, not a /tmp log).
+_codex_log_has_verdict_message "$FIXTURES/codex-gather-only-turn.jsonl"
+assert_eq "TC-CXR-DET-09b review-193 gather-only fixture → rc 1 (resumes)" 1 "$?"
+
+# TC-CXR-DET-10 — a PASS verdict trailer in the last turn → converged (rc 0).
+{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$VERDICT_TURN"; } > "$TMPLOG"
+_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-10 Review PASSED trailer → rc 0 (converged)" 0 "$?"
+
+# TC-CXR-DET-10b — a committed PASS-verdict fixture (Review PASSED + Review Agent: codex).
+_codex_log_has_verdict_message "$FIXTURES/codex-verdict-turn.jsonl"
+assert_eq "TC-CXR-DET-10b verdict fixture → rc 0 (converged)" 0 "$?"
+
+# TC-CXR-DET-11 — a FAIL verdict trailer (`Review findings:`) → converged (rc 0).
+# A failing verdict is still a verdict — codex posted its decision, do not resume.
+{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$FAIL_VERDICT_TURN"; } > "$TMPLOG"
+_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-11 Review findings: (FAIL verdict) → rc 0 (converged)" 0 "$?"
+
+# TC-CXR-DET-12 — the `Review Agent: codex` discriminator trailer alone → converged.
+{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$AGENT_TRAILER_TURN"; } > "$TMPLOG"
+_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-12 Review Agent: codex trailer → rc 0 (converged)" 0 "$?"
+
+# TC-CXR-DET-13 — last-turn-decides for the verdict-trailer rule: a verdict in an
+# EARLIER turn followed by a narration-only LAST turn must NOT count (rc 1). Pins
+# that the per-turn reset still applies to the new trailer match.
+{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$VERDICT_TURN"; echo "$NARRATION_TURN"; } > "$TMPLOG"
+_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-13 verdict then narration-only last turn → rc 1" 1 "$?"
+
+# TC-CXR-DET-14 — tool-output containing a verdict PHRASE (e.g. codex catting
+# SKILL.md / the prompt, whose text literally contains "Review PASSED") must NOT
+# be a false verdict — the phrase must be inside an agent_message item, not a
+# command_execution aggregated_output. Strengthens TC-CXR-DET-08 for the new
+# text-based match.
+{ echo '{"type":"thread.started","thread_id":"aaaa"}'
+  echo '{"type":"turn.started"}'
+  echo '{"type":"item.completed","item":{"type":"command_execution","command":"cat SKILL.md","aggregated_output":"... post a comment with Review PASSED on the first line ..."}}'
+  echo '{"type":"turn.completed","usage":{"input_tokens":5000}}'; } > "$TMPLOG"
+_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-14 verdict phrase in tool output not a false verdict → rc 1" 1 "$?"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -254,11 +326,11 @@ assert_eq "TC-CXR-CTL-03 never converges, max=3 → 1 run, 3 resume (bounded)" "
 out=$(run_codex_controller_case $'gather\ngather' 3 $'0\n999999')
 assert_eq "TC-CXR-CTL-04 wall-clock exceeded → 1 run, 0 resume (deadline guard)" "0|1|0" "$out"
 
-# TC-CXR-CTL-05 — resume prompt content
+# TC-CXR-CTL-05 — resume prompt content (via the controller)
 run_codex_controller_case $'gather\nverdict' 3 $'0\n10\n20\n30' >/dev/null
 resume_prompt=$(cat "$REC_RESUME_ARGV")
-assert_contains "TC-CXR-CTL-05a resume prompt says NOT to re-run git diff" \
-  "NOT re-run \`git diff\`" "$resume_prompt"
+assert_contains "TC-CXR-CTL-05a resume prompt tells codex to reuse already-loaded context" \
+  "ALREADY loaded" "$resume_prompt"
 assert_contains "TC-CXR-CTL-05b resume prompt tells codex to post the verdict" \
   "verdict" "$resume_prompt"
 
@@ -359,6 +431,53 @@ ctl12=$(
   rm -rf "$sandbox"
 )
 assert_eq "TC-CXR-CTL-12 mid-loop resume timeout sticky through clean resume → returns 124" 124 "$ctl12"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== TC-CXR-RP: _codex_resume_prompt content (context-compaction safety) ==="
+# ---------------------------------------------------------------------------
+# #198 follow-up: the original resume prompt said "do NOT re-run git diff and do
+# NOT re-read files you already read" — an ABSOLUTE instruction. When codex's own
+# context is compacted between turns (the diff is no longer in its working
+# context), that absolute bar left codex unable to substantiate a verdict, so it
+# defensively posted a [BLOCKING] "review context unavailable" FAIL instead of a
+# real verdict (observed on the codex lane reviewing PR #199 itself). The prompt
+# must instead PREFER reusing already-loaded context but ALLOW re-reading the
+# minimum needed when that context is gone — and must NEVER tell codex to refuse a
+# verdict for lack of context.
+rp=$(_codex_resume_prompt "sess-uuid-xyz")
+
+# TC-CXR-RP-01 — the prompt no longer contains the ABSOLUTE "do NOT re-read files"
+# bar (the instruction that stranded a compacted turn).
+if [[ "$rp" == *"do NOT re-read"* || "$rp" == *"do not re-read"* ]]; then
+  echo -e "  ${RED}FAIL${NC}: TC-CXR-RP-01 prompt must not contain an absolute 'do NOT re-read' bar"
+  FAIL=$((FAIL + 1))
+else
+  echo -e "  ${GREEN}PASS${NC}: TC-CXR-RP-01 no absolute 'do NOT re-read' bar"
+  PASS=$((PASS + 1))
+fi
+
+# TC-CXR-RP-02 — the prompt explicitly ALLOWS re-reading when context is gone.
+assert_contains "TC-CXR-RP-02 prompt allows re-reading when context is unavailable" \
+  "re-read" "$rp"
+
+# TC-CXR-RP-03 — the prompt still prefers reusing already-loaded context (avoid
+# gratuitous re-gather on the common path).
+assert_contains "TC-CXR-RP-03 prompt prefers already-loaded context" \
+  "ALREADY loaded" "$rp"
+
+# TC-CXR-RP-04 — the prompt instructs codex to ISSUE a verdict, not to refuse one
+# for lack of context (the defensive-bail the codex lane produced).
+assert_contains "TC-CXR-RP-04a prompt tells codex to post a verdict" \
+  "post your verdict" "$rp"
+assert_contains "TC-CXR-RP-04b prompt names the never-refuse rule" \
+  "do NOT refuse" "$rp"
+
+# TC-CXR-RP-05 — the attribution trailers (INV-40/INV-20) are still present.
+assert_contains "TC-CXR-RP-05a prompt carries the Review Agent discriminator" \
+  "Review Agent: codex" "$rp"
+assert_contains "TC-CXR-RP-05b prompt carries the session uuid" \
+  "sess-uuid-xyz" "$rp"
 
 # ---------------------------------------------------------------------------
 echo ""

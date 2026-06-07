@@ -1536,11 +1536,16 @@ Sub-rules:
    `_codex_log_has_verdict_message <log>` scans codex's own `--json` event log
    (the same per-agent log the invocation writes) and returns true iff the LAST
    **completed** turn (segment ending at the final `turn.completed`) contains an
-   `item.completed` whose item type is `agent_message`. A turn whose items are
-   all `tool_call`/`reasoning` (a `git diff` + file reads turn) is gather-only →
-   the resume trigger. An `agent_message` with no trailing `turn.completed` (turn
-   still in flight / killed) does NOT count. Empty/missing log → no verdict (rc 1,
-   never crashes). Awk-based (jq is not a hard dep — mirrors `_codex_capture_thread`).
+   `item.completed` `agent_message` **whose text carries a VERDICT TRAILER**
+   ([INV-53](#inv-53-codex-review-convergence-keys-on-the-verdict-trailer-not-any-agent_message); amended here from the original
+   #189 "any `agent_message`" rule). A turn whose items are all
+   `tool_call`/`reasoning`/`command_execution` (a `git diff` + file reads turn) is
+   gather-only → the resume trigger; **and so is a turn whose only `agent_message`s
+   are PROGRESS NARRATION** (no verdict trailer) — the #198 correction. An
+   `agent_message` with no trailing `turn.completed` (turn still in flight /
+   killed) does NOT count. Empty/missing log → no verdict (rc 1, never crashes).
+   Awk-based (jq is not a hard dep — mirrors `_codex_capture_thread`). See
+   [INV-53](#inv-53-codex-review-convergence-keys-on-the-verdict-trailer-not-any-agent_message) for the verdict-trailer phrasing set and the resume-carries-session finding.
 2. **The loop NEVER queries the GitHub comments API.** That is the wrapper's
    verdict poller's job ([INV-20](#inv-20-verdict-authenticity-binding-actor--window--trailer-presence)/[INV-40](#inv-40-multi-agent-review-attribution-unanimous-aggregation-and-all-unavailable-fallback)),
    which stays the **authoritative** verdict gate AFTER the controller returns.
@@ -1610,12 +1615,21 @@ continue-and-emit-verdict prompt), `_codex_now_seconds` (clock seam). The fan-ou
 and the [INV-40](#inv-40-multi-agent-review-attribution-unanimous-aggregation-and-all-unavailable-fallback) aggregation — both UNCHANGED. The codex `run_agent`/`resume_agent`
 branches in `lib-agent.sh` are reused, not modified.
 
-**Status**: **ENFORCED** in this PR (closes #189).
+**Status**: **ENFORCED** (closes #189). **Amended by [INV-53](#inv-53-codex-review-convergence-keys-on-the-verdict-trailer-not-any-agent_message) (#198)**: the
+convergence signal in sub-rule 1 now keys on the **verdict trailer** in the
+`agent_message` text, not on the mere presence of an `agent_message` — the
+original any-message rule false-converged on codex's progress narration and the
+codex member was still dropped `unavailable`. The resume loop, its bounds, the
+layer, and the INV-48 rc-stickiness (sub-rule 4) are **unchanged**.
 
-**Test**: `tests/unit/test-lib-review-codex.sh` — TC-CXR-DET-01..08
+**Test**: `tests/unit/test-lib-review-codex.sh` — TC-CXR-DET-01..14
 (`_codex_log_has_verdict_message`: last-turn-decides, gather-only, empty/missing,
-mid-flight turn, the cross-turn killed-mid-message leak, and the tool-output
-`agent_message` substring false-positive — #189 review finding 2), TC-CXR-DL-01..06
+mid-flight turn, the cross-turn killed-mid-message leak, the tool-output
+`agent_message` substring false-positive — #189 review finding 2 — and the
+[INV-53](#inv-53-codex-review-convergence-keys-on-the-verdict-trailer-not-any-agent_message)
+verdict-trailer cases DET-09..14: narration-only → resumes, pass/fail/discriminator
+trailers → converge, last-turn-decides for the trailer, and a verdict-phrase in a
+tool output not a false verdict — #198), TC-CXR-DL-01..06
 (`_codex_review_deadline_seconds`: units + garbage→1h default), TC-CXR-CTL-01..12
 (controller: one-resume-then-verdict, immediate-verdict-no-resume,
 never-converges-bounded-at-max, wall-clock guard, resume prompt content,
@@ -1638,6 +1652,122 @@ stay green. Test plan: `docs/test-cases/codex-review-resume-loop.md`.
 - [INV-34](#inv-34-agent-prompt-is-fed-via-stdin-never-as-a-single-argv-element) — the stdin prompt channel the reused codex `run_agent`/`resume_agent` branches uphold.
 - [`review-agent-flow.md` § Codex auto-resume (INV-51)](review-agent-flow.md#codex-auto-resume-inv-51) — runtime walkthrough.
 - [`docs/designs/codex-review-resume-loop.md`](../designs/codex-review-resume-loop.md) — design canvas.
+- [INV-53](#inv-53-codex-review-convergence-keys-on-the-verdict-trailer-not-any-agent_message) — the corrected convergence contract (#198).
+
+## INV-53: codex review convergence keys on the VERDICT TRAILER, not any `agent_message`
+
+**Rule**: the [INV-51](#inv-51-codex-review-thread-auto-resumes-until-a-verdict-posting-turn)
+convergence detector `lib-review-codex.sh::_codex_log_has_verdict_message` MUST
+treat codex's last completed turn as **converged only when it posted the VERDICT**
+— i.e. when an `item.completed` `agent_message` in that turn carries a **verdict
+trailer**: one of the pass/fail phrasings the wrapper poller itself matches
+(`lib-review-poll.sh::_classify_verdict_body`) **or** the `Review Agent: codex`
+attribution discriminator the resume prompt forces codex to emit. A turn whose
+`agent_message`s are pure **progress narration** ("Next I'm reading the
+instructions…", "I'll verify the PR…") is **gather-only** → the loop RESUMES
+(bounded by `CODEX_REVIEW_MAX_RESUMES` + the wall-clock deadline, unchanged).
+
+Recognised verdict-trailer phrases (case-insensitive substring, kept in sync with
+the poller so the two ALWAYS agree): pass-side `Review PASSED` / `Review APPROVED`
+/ `APPROVED FOR MERGE` / `LGTM` / `Review PASS`; fail-side `Review FAILED` /
+`Review REJECTED` / `Review findings:` / `Changes requested`; plus
+`Review Agent: codex`.
+
+Sub-rules:
+
+1. **The trailer must be inside an `agent_message` item, on the same JSONL line.**
+   The match conjoins (a) `item.completed`, (b) item-scoped `agent_message`
+   (`"item":{…,"type":"agent_message"…}`), and (c) a verdict-trailer phrase — all
+   on one physical line (codex emits one event per line; newlines inside the text
+   are escaped as `\n`). So a verdict PHRASE appearing in a separate
+   `command_execution` `aggregated_output` line within the same turn (codex catting
+   `SKILL.md` / the review prompt, both of which contain the literal phrasings)
+   does NOT count — it fails conjunct (b). This subsumes the #189 review-finding-2
+   substring guard and extends it to the text match.
+2. **Plain substrings, no word boundaries.** The phrases are matched as plain
+   case-insensitive substrings — IDENTICAL to the poller's `grep -qiE` — so the
+   detector and the authoritative comment poller never disagree, AND the awk stays
+   portable to any POSIX awk (gawk `\<`/`\>` word boundaries are a GNU extension
+   this subsystem must not depend on, mirroring `_codex_capture_thread`).
+3. **Fail-safe toward resuming.** An ambiguous / narration-only turn RESUMES
+   (bounded), it never false-STOPS. Worst case wastes one bounded resume; it never
+   silently drops codex by false-converging. The [INV-51](#inv-51-codex-review-thread-auto-resumes-until-a-verdict-posting-turn)
+   last-turn-decides + per-turn-reset + mid-flight rules are preserved verbatim
+   (a trailer in an EARLIER turn, or in a turn with no `turn.completed`, does NOT
+   count).
+4. **The INV-48 timeout rc-stickiness is orthogonal and UNCHANGED.** This rule
+   only changes the *gather-only DETECTION*; the controller's rc handling — a
+   per-turn `124`/`137` stays sticky so a timed-out codex turn vetoes via the
+   wrapper sweep ([INV-48](#inv-48-per-side-review-wall-clock-timeout-agent_review_timeout-1h-default-with-browser-e2e-exclusion-and-timeout-veto)) — is byte-for-byte the #194 code.
+5. **The resume prompt must not strand a context-compacted turn.**
+   `_codex_resume_prompt` PREFERS the context codex already loaded (avoid
+   gratuitous re-gather on the common path, the INV-51 goal) but **explicitly
+   allows re-reading the minimum needed when codex's own context was compacted**
+   and the diff/files are no longer in its working context, and instructs codex to
+   **NEVER refuse a verdict for lack of context** ("I cannot verify because my
+   context is unavailable" is not a valid finding). The original #189 prompt was
+   ABSOLUTE ("do NOT re-run `git diff` and do NOT re-read files you already read"),
+   which left a compacted codex turn unable to substantiate a verdict — it
+   defensively posted a `[BLOCKING] review context unavailable` FAIL (a
+   non-substantive deciding FAIL that blocked the merge), observed on the codex
+   lane reviewing the very PR that added INV-53. Softening the prompt removes that
+   strand-on-compaction failure mode without re-opening the gather-the-whole-turn
+   problem INV-51 solved.
+
+**Investigation finding (recorded so it is not re-litigated)**: #198 hypothesised
+that `codex exec resume <tid>` is a **no-op on the amazon-bedrock provider** (each
+resume mints a fresh `thread.started`, re-reads everything from zero), which would
+invalidate INV-51's premise. A minimal `remember 42` repro on **codex-cli 0.137.0**
+(`model_provider=amazon-bedrock`, `openai.gpt-5.5`, `us-east-2`) **DISPROVES** this:
+resume KEEPS the same `thread.started` id across turns, the prior conversation is
+replayed and Bedrock-prompt-cached (growing `input_tokens` with non-zero
+`cached_input_tokens`), and codex recalls prior context (`OK 42` → `RECALL 42` →
+`AGAIN 42`). So **resume does carry session** on the current CLI; the resume loop
+is sound and is KEPT. The issue's prod-log evidence (distinct thread ids per
+dispatch) is most consistent with an older codex CLI or the `_codex_capture_thread`
+sidecar being clobbered on each resume — not a provider limitation. The artifact
+is `tests/unit/fixtures/codex-resume-carry-session-repro.txt`.
+
+**Why**: codex emits `agent_message` for narration, not only for the final
+findings. A gather-heavy turn (mergeability check, SKILL read, issue-comment read)
+that narrates then ends WITHOUT posting the verdict tripped the original
+any-`agent_message` detector as "converged" → the loop broke on round 1, no resume
+fired, the comment poller found no verdict, and codex was dropped `unavailable` —
+exactly the failure INV-51 was meant to prevent. Verified against a real review-193
+codex log (`input_tokens:138668, output_tokens:746`, three short narration
+`agent_message`s, never read the diff, never posted a verdict): the pre-fix
+detector returned converged. Keying on the verdict trailer makes "the JSONL stream
+shows a verdict-shaped message" agree with "the poller will find the comment".
+
+**Rejected alternatives**: abandon resume and inline the full diff in the prompt
+(rejected by INV-51 already — bloats on large diffs, loses codex's file
+navigation, diverges the codex prompt shape; and now moot because resume DOES carry
+session); use the GitHub comment poller as the in-loop break signal (wrong layer —
+adds per-turn GitHub latency and violates [INV-51](#inv-51-codex-review-thread-auto-resumes-until-a-verdict-posting-turn) sub-rule 2; the JSONL trailer is a cheap local proxy and the poller remains the authoritative post-loop gate).
+
+**Producer**: `lib-review-codex.sh::_codex_log_has_verdict_message` (the verdict-trailer match, sub-rules 1–4) and `_codex_resume_prompt` (the context-compaction-safe prompt, sub-rule 5). The controller, deadline parser, and rc-stickiness are unchanged from [INV-51](#inv-51-codex-review-thread-auto-resumes-until-a-verdict-posting-turn).
+
+**Consumer**: the [INV-51](#inv-51-codex-review-thread-auto-resumes-until-a-verdict-posting-turn) resume controller (the break condition), and downstream the wrapper's authoritative comment poller ([INV-40](#inv-40-multi-agent-review-attribution-unanimous-aggregation-and-all-unavailable-fallback)) — unchanged.
+
+**Status**: **ENFORCED** in this PR (closes #198).
+
+**Test**: `tests/unit/test-lib-review-codex.sh` — TC-CXR-DET-09..14
+(narration-only → rc 1 / resumes, incl. the committed `fixtures/codex-gather-only-turn.jsonl`;
+pass/fail/discriminator trailers → rc 0; last-turn-decides for the trailer; a
+verdict phrase in a tool output is not a false verdict) and TC-CXR-RP-01..05
+(sub-rule 5: the resume prompt drops the absolute "do NOT re-read" bar, allows
+minimal re-reading on context compaction, prefers already-loaded context, instructs
+codex to never refuse a verdict for missing context, and keeps the INV-40/INV-20
+attribution trailers). Investigation artifact:
+`tests/unit/fixtures/codex-resume-carry-session-repro.txt`. Test plan:
+`docs/test-cases/codex-review-resume-loop.md`.
+
+**Cross-references**:
+- [INV-51](#inv-51-codex-review-thread-auto-resumes-until-a-verdict-posting-turn) — the resume loop this corrects the convergence signal of (and which this confirms is sound).
+- [INV-40](#inv-40-multi-agent-review-attribution-unanimous-aggregation-and-all-unavailable-fallback) — the authoritative comment poller / `unavailable` fallback whose phrasings this match mirrors.
+- [INV-48](#inv-48-per-side-review-wall-clock-timeout-agent_review_timeout-1h-default-with-browser-e2e-exclusion-and-timeout-veto) — the timeout rc-stickiness preserved unchanged.
+- [`review-agent-flow.md` § Codex auto-resume (INV-51)](review-agent-flow.md#codex-auto-resume-inv-51) — runtime walkthrough (updated for the verdict-trailer signal).
+- [`docs/designs/codex-convergence-verdict-detection.md`](../designs/codex-convergence-verdict-detection.md) — design canvas.
 
 ## Adding a new invariant
 

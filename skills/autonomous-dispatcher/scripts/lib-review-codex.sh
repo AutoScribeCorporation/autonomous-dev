@@ -73,54 +73,93 @@ _codex_review_deadline_seconds() {
 # _codex_log_has_verdict_message <log_file>
 #
 # rc 0 iff codex's LAST COMPLETED turn (the segment ending at the final
-# `turn.completed` event) contained an `item.completed` whose item type is
-# `agent_message`. rc 1 otherwise — including an empty/missing log, a log whose
-# last turn is gather-only (only `tool_call`/`reasoning` items), or a log whose
-# final turn has NOT completed yet (an agent_message with no trailing
+# `turn.completed` event) contained an `item.completed` `agent_message` whose
+# TEXT carries a VERDICT TRAILER — one of the verdict phrasings the wrapper's
+# comment poller itself recognises (`lib-review-poll.sh::_classify_verdict_body`)
+# or the `Review Agent: codex` attribution trailer the resume prompt forces codex
+# to emit. rc 1 otherwise — including an empty/missing log, a gather-only last
+# turn (only `tool_call`/`reasoning`/`command_execution` items), a last turn whose
+# only `agent_message`s are PROGRESS NARRATION (no verdict trailer), or a log
+# whose final turn has NOT completed yet (a message with no trailing
 # `turn.completed` does not count — the turn is still in flight).
 #
-# This is the "did codex's last turn converge on output?" signal, NOT a
-# GitHub-comment check (that is the wrapper poller's job — see LAYER above). An
-# `agent_message` is codex's final assistant message for a turn; once codex emits
-# one, it has produced its findings and further resumes are wasteful. The poller
-# then confirms whether the verdict comment actually landed.
+# #198 / INV-53: this used to converge on ANY `agent_message` in the last turn.
+# But codex emits `agent_message` for narration ("Next I'm reading the
+# instructions…", "I'll verify the PR…"), not only for the final verdict. A
+# gather-heavy turn that narrates then dies before posting the verdict tripped the
+# old heuristic as "converged" → no resume → the poller found no verdict comment →
+# codex was dropped `unavailable`. Convergence MUST mean "codex posted the
+# VERDICT", not "codex emitted any assistant message". So we now require the
+# verdict-trailer text inside an `agent_message` item.
+#
+# This is the "did codex's last turn produce the verdict?" signal, NOT a
+# GitHub-comment check (that is the wrapper poller's job — see LAYER above): the
+# poller stays the AUTHORITATIVE gate. Keying on the SAME phrasings the poller
+# matches makes the two agree — "the JSONL stream shows a verdict-shaped message"
+# ⇒ "the poller will find the comment". It is fail-safe toward RESUMING: an
+# ambiguous turn resumes (bounded), it never false-stops; worst case wastes one
+# bounded resume, never silently drops codex.
 #
 # Why awk: jq is not a hard dependency of this subsystem (mirrors
-# lib-agent.sh::_codex_capture_thread). Codex `--json` emits one event per line.
-# We do a single pass tracking, per turn, whether an agent_message item was seen
-# (`cur_msg`); `turn.started` resets it at each turn boundary and `turn.completed`
-# snapshots it into `last`, then resets it. The final `last` snapshot is the
-# answer.
+# lib-agent.sh::_codex_capture_thread). Codex `--json` emits one event per line
+# (JSONL; newlines inside an agent_message text are escaped as \n, so the whole
+# item — type AND text — is on ONE physical line). We do a single pass tracking,
+# per turn, whether a verdict-trailer agent_message was seen (`cur_msg`);
+# `turn.started` resets it at each turn boundary and `turn.completed` snapshots it
+# into `last`, then resets it. The final `last` snapshot is the answer.
 _codex_log_has_verdict_message() {
   local log_file="${1:-}"
   [[ -n "$log_file" && -f "$log_file" ]] || return 1
   local result
   result=$(awk '
     {
-      # An item.completed carrying an agent_message marks the CURRENT turn as
-      # having produced an assistant message. Match both event type and the
-      # item type on the same JSONL line (codex emits one event per line).
-      # The narrowed item-scoped match (vs a bare type match anywhere on the
-      # line) requires the agent_message type to live INSIDE the item object, so
-      # a tool_call whose OUTPUT text contains the literal substring (e.g. codex
-      # grepping its own JSONL log) is NOT a false verdict (#189 review finding
-      # 2). The bracket window assumes type is a leading flat key of item (the
+      # An item.completed carrying an agent_message whose TEXT contains a verdict
+      # trailer marks the CURRENT turn as having posted the verdict. Three
+      # conjuncts on the same JSONL line (codex emits one event per line):
+      #   (1) the event is an item.completed;
+      #   (2) the item type is agent_message, scoped INSIDE the item object
+      #       (`"item":{...,"type":"agent_message"...}`) — NOT a bare type match
+      #       anywhere on the line, so a tool_call/command_execution whose OUTPUT
+      #       text contains the literal substring (e.g. codex grepping its own
+      #       JSONL log) is NOT a false verdict (#189 review finding 2);
+      #   (3) the line contains a VERDICT-TRAILER phrase (#198 / INV-53) — the
+      #       pass/fail phrasings the wrapper poller matches plus the
+      #       `Review Agent: codex` discriminator. Matched case-insensitively on a
+      #       lowercased copy of the line. Conjunct (3) is what rejects pure
+      #       progress narration: a narration agent_message satisfies (1)+(2) but
+      #       carries no verdict trailer, so it does NOT set the flag.
+      # Because all three conjuncts must hold ON THE SAME LINE, a verdict PHRASE
+      # appearing in a SEPARATE command_execution line within the same turn (codex
+      # catting SKILL.md / the prompt) cannot trip the flag — that line fails (2).
+      # The bracket window assumes type is a leading flat key of item (the
       # documented codex event shape). If a future codex schema nested an object
-      # BEFORE type inside item, this would false-NEGATIVE -- but that only
-      # wastes one extra resume (fail-safe), never misses a real verdict.
+      # BEFORE type inside item, this would false-NEGATIVE -- but that only wastes
+      # one extra resume (fail-safe), never misses a real verdict.
       # (Comment kept apostrophe-free: this awk body is inside single quotes.)
       if ($0 ~ /"type":"item\.completed"/ && $0 ~ /"item":\{[^{}]*"type":"agent_message"/) {
-        cur_msg = 1
+        line = tolower($0)
+        # Verdict trailers: pass-side, fail-side, and the codex attribution
+        # discriminator. Mirrors lib-review-poll.sh::_classify_verdict_body
+        # (kept in sync) plus `Review Agent: codex`. `review pass` also matches
+        # the longer `review passed`; that is intentional (both are pass-side).
+        # Plain substring matches (no word boundaries) in a single ERE
+        # alternation — same shape as the poller (`grep -qiE`) so the two ALWAYS
+        # agree, AND portable to any POSIX awk (gawk `\<`/`\>` are a GNU extension
+        # this subsystem must not depend on, mirroring _codex_capture_thread).
+        # Order is pass-side, fail-side, then the codex discriminator.
+        if (line ~ /review passed|review approved|approved for merge|lgtm|review pass|review failed|review rejected|review findings:|changes requested|review agent: *codex/) {
+          cur_msg = 1
+        }
       }
-      # turn.started opens a NEW turn — reset the per-turn flag so an
-      # agent_message from a PRIOR turn that was killed before its own
-      # turn.completed (the per-turn cap firing mid-stream, rc 124/137) does NOT
-      # leak across the boundary and falsely mark THIS turn as having a verdict.
+      # turn.started opens a NEW turn — reset the per-turn flag so a verdict
+      # message from a PRIOR turn that was killed before its own turn.completed
+      # (the per-turn cap firing mid-stream, rc 124/137) does NOT leak across the
+      # boundary and falsely mark THIS turn as having a verdict.
       if ($0 ~ /"type":"turn\.started"/) {
         cur_msg = 0
       }
       # turn.completed closes the current turn: snapshot whether it had a
-      # message, then reset for the next turn.
+      # verdict message, then reset for the next turn.
       if ($0 ~ /"type":"turn\.completed"/) {
         last = cur_msg
         cur_msg = 0
@@ -135,20 +174,40 @@ _codex_log_has_verdict_message() {
 }
 
 # _codex_resume_prompt — the explicit continue-and-emit-verdict prompt fed to
-# each resume turn. Tells codex to stop re-gathering and produce the verdict NOW,
-# carrying the same discriminator/session lines the wrapper's verdict poller
-# binds on (INV-40 / INV-20). $1 = the agent's Review Session UUID.
+# each resume turn. Tells codex to PREFER the context it already loaded and
+# produce the verdict NOW, carrying the same discriminator/session lines the
+# wrapper's verdict poller binds on (INV-40 / INV-20). $1 = the agent's Review
+# Session UUID.
+#
+# #198 follow-up: the original prompt was ABSOLUTE — "do NOT re-run git diff and
+# do NOT re-read files you already read". But codex compacts its OWN context on a
+# long turn, so on resume the diff may no longer be in its working context. The
+# absolute bar then left codex unable to substantiate a verdict, and it
+# defensively posted a "[BLOCKING] review context unavailable" FAIL instead of a
+# real verdict (observed on the codex lane reviewing PR #199 itself). So the
+# prompt now PREFERS reuse to avoid gratuitous re-gather on the common path but
+# EXPLICITLY allows re-reading the minimum needed when that context is gone, and
+# instructs codex to NEVER refuse a verdict for lack of context. This keeps the
+# INV-51 goal (don't burn the turn re-gathering everything) while removing the
+# strand-on-compaction failure mode.
 _codex_resume_prompt() {
   local session_uuid="${1:-}"
   cat <<EOF
 Continue the review of the PR diff you ALREADY loaded in the previous turn(s).
-Do NOT re-run \`git diff\` and do NOT re-read files you already read — that work
-is done and re-doing it wastes the turn. Produce your review findings NOW and
-post your verdict comment on the issue:
+Prefer the context you already have — do not gratuitously re-run \`git diff\` or
+re-read files that are still in your context, since re-doing finished work wastes
+the turn. BUT if your context was compacted and the diff or a file you need is no
+longer available to you, re-read the minimum you need to reach a substantiated
+verdict — do NOT refuse to issue a verdict merely because context is missing.
+Produce your review findings NOW and post your verdict comment on the issue:
 
 - A passing verdict: a comment whose body contains "Review PASSED".
 - A failing verdict: a comment whose body starts with "Review findings:" and
   lists each blocking finding.
+
+A finding must be about the PR's CODE (correctness, tests, requirements, CI,
+security). "I cannot verify because my context is unavailable" is NOT a valid
+finding — re-read what you need and decide.
 
 Your verdict comment MUST include these two lines verbatim so the wrapper can
 attribute it:
