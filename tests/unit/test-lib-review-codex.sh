@@ -1,24 +1,24 @@
 #!/bin/bash
-# test-lib-review-codex.sh — Unit tests for the codex review auto-resume loop
-# (INV-51, issue #189).
+# test-lib-review-codex.sh — Unit tests for the codex review path that runs the
+# purpose-built `codex review "<prompt>"` subcommand (INV-62, issue #218).
 #
-# The codex member of a multi-agent review fleet was dropped as `unavailable`
-# on large diffs because `codex exec` runs ONE agentic turn consumed by
-# context-gathering (git diff, file reads) before posting a verdict. This lib
-# adds a codex-specific review path that watches codex's JSONL event stream and
-# auto-resumes the SAME thread while turns end gather-only, bounded by a max
-# resume count AND a wall-clock deadline.
+# This refactor REPLACES the pre-#218 `codex exec` + resume-loop machinery
+# (_run_codex_review_with_resume, _codex_log_has_verdict_message, the INV-55
+# inline-diff prompt) with `codex review`, which is natively multi-step and
+# auto-scopes the diff to the PR's merge target. Verdict capture is double-insured:
+# the prompt asks codex to self-post via post-verdict.sh, AND the wrapper parses
+# codex review's stdout (`[P1]` → FAIL else PASS) and posts on codex's behalf if it
+# did not self-post.
 #
 # Tests:
-#   - _codex_log_has_verdict_message: detects whether codex's LAST completed
-#     turn contained a verdict-posting agent_message
-#   - _codex_review_deadline_seconds: parses AGENT_REVIEW_TIMEOUT to seconds
-#     (1h default, never unbounded)
-#   - _run_codex_review_with_resume: the bounded resume-loop controller
-#
-# Strategy: stub run_agent / resume_agent so each APPENDS scripted JSONL turns
-# to the per-agent log and records its call count + argv; stub the clock so the
-# wall-clock bound is deterministic.
+#   - _codex_review_classify_stdout: stdout → pass|fail (P1 present/absent/empty)
+#   - _codex_review_compose_body: canonical body composition for the fallback post
+#   - _codex_review_argv: the `codex review` argv shape (no -m / --base / --json)
+#   - _run_codex_review: launch + bounded re-run (subsumes #209) + sticky timeout rc
+#   - _codex_review_has_stream_error / _classify_codex_drop_reason /
+#     _codex_drop_reason_phrase: stdout-based stream-error drop reason
+#   - wrapper-wiring source-of-truth assertions (codex review subcommand routed,
+#     resume loop + JSONL parser + inline-diff deleted, dev path unchanged)
 #
 # Run: bash tests/unit/test-lib-review-codex.sh
 
@@ -30,6 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LIB="$PROJECT_ROOT/skills/autonomous-dispatcher/scripts/lib-review-codex.sh"
 WRAPPER="$PROJECT_ROOT/skills/autonomous-dispatcher/scripts/autonomous-review.sh"
+AGENT_LIB="$PROJECT_ROOT/skills/autonomous-dispatcher/scripts/lib-agent.sh"
 CI="$PROJECT_ROOT/.github/workflows/ci.yml"
 FIXTURES="$SCRIPT_DIR/fixtures"
 
@@ -58,6 +59,17 @@ assert_grep() {
   else
     echo -e "  ${RED}FAIL${NC}: $desc (pattern: $pattern)"
     FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_no_grep() {
+  local desc="$1" pattern="$2" file="$3"
+  if grep -qE "$pattern" "$file"; then
+    echo -e "  ${RED}FAIL${NC}: $desc (should NOT match: $pattern)"
+    FAIL=$((FAIL + 1))
+  else
+    echo -e "  ${GREEN}PASS${NC}: $desc"
+    PASS=$((PASS + 1))
   fi
 }
 
@@ -97,1098 +109,935 @@ assert_not_contains() {
 # shellcheck source=../../skills/autonomous-dispatcher/scripts/lib-review-codex.sh
 source "$LIB"
 
-# Scripted JSONL turn fragments -----------------------------------------------
-GATHER_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"i0","type":"reasoning","text":"thinking"}}
-{"type":"item.completed","item":{"id":"i1","type":"tool_call","name":"shell"}}
-{"type":"turn.completed","usage":{"input_tokens":55000,"output_tokens":3}}'
-
-VERDICT_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"i2","type":"tool_call","name":"shell"}}
-{"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"Review PASSED"}}
-{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":900}}'
-
-# A turn that emits agent_message items that are PROGRESS NARRATION only — no
-# verdict trailer (`Review PASSED` / `Review findings:` / `Review Agent: codex`).
-# This is the #198 root-cause-2 shape: the pre-fix detector (which matched ANY
-# agent_message) false-converged on this; the verdict-trailer detector must treat
-# it as gather-only (rc 1) so the loop RESUMES.
-NARRATION_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"n0","type":"command_execution","command":"gh pr view 197 --json mergeable","aggregated_output":"MERGEABLE"}}
-{"type":"item.completed","item":{"id":"n1","type":"agent_message","text":"Next I'\''m reading the workflow instructions to understand the checklist."}}
-{"type":"item.completed","item":{"id":"n2","type":"agent_message","text":"I'\''ll verify the PR reflects both changes."}}
-{"type":"turn.completed","usage":{"input_tokens":138668,"output_tokens":746}}'
-
-# A FAIL verdict turn: agent_message text begins with the fail-side trailer.
-FAIL_VERDICT_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"f0","type":"tool_call","name":"shell"}}
-{"type":"item.completed","item":{"id":"f1","type":"agent_message","text":"Review findings:\n1. [BLOCKING] missing test coverage.\nReview Agent: codex"}}
-{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":400}}'
-
-# A turn whose only verdict signal is the `Review Agent: codex` discriminator
-# trailer (the resume prompt forces codex to emit this) — must converge.
-AGENT_TRAILER_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"a0","type":"agent_message","text":"Review PASS - looks good.\nReview Session: `sid`\nReview Agent: codex"}}
-{"type":"turn.completed","usage":{"input_tokens":3000,"output_tokens":120}}'
-
-# #214 — a turn whose verdict is posted by RUNNING the INV-56 helper
-# `bash scripts/post-verdict.sh <issue> pass …` (a command_execution), with NO
-# verdict-trailer agent_message. Since INV-56 the verdict lands in a
-# command_execution, not an agent_message — the detector must converge on it
-# (else the resume loop fires a redundant resume → double-posted verdict).
-POST_VERDICT_PASS_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"p0","type":"reasoning","text":"diff reviewed; posting verdict via helper"}}
-{"type":"item.completed","item":{"id":"p1","type":"command_execution","command":"bash scripts/post-verdict.sh 212 pass /tmp/verdict-codex.md codex 8cc4c347-aaaa-bbbb-cccc-444444444444 '\''openai.gpt-5.5'\''","aggregated_output":"https://github.com/OWNER/REPO/issues/212#issuecomment-REDACTED"}}
-{"type":"turn.completed","usage":{"input_tokens":54210,"cached_input_tokens":48000,"output_tokens":210}}'
-
-# #214 — the same but a FAILING verdict via the helper (`… fail …`). A failing
-# verdict posted through the helper is still a verdict; the loop must converge.
-POST_VERDICT_FAIL_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"pf0","type":"command_execution","command":"bash scripts/post-verdict.sh 212 fail /tmp/verdict-codex.md codex 8cc4c347-aaaa-bbbb-cccc-444444444444 '\''openai.gpt-5.5'\''","aggregated_output":"https://github.com/OWNER/REPO/issues/212#issuecomment-REDACTED"}}
-{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":300}}'
-
-# #214 — a NARRATION turn that merely MENTIONS post-verdict.sh in an agent_message
-# (no command_execution invoking it, no verdict trailer). Must NOT converge — the
-# helper signal must be inside a command_execution item, not narration text
-# (mirrors the DET-08/14 item-scope guard for the command path).
-POST_VERDICT_NARRATION_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"pn0","type":"agent_message","text":"Next I will run bash scripts/post-verdict.sh 212 pass to post the verdict."}}
-{"type":"turn.completed","usage":{"input_tokens":40000,"output_tokens":80}}'
-
-# #214 — a gather-only turn whose ONLY command_execution is a non-verdict command
-# (gh pr view). Must NOT converge (no over-claim; the INV-53 narration guard holds).
-NON_VERDICT_CMD_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"nc0","type":"command_execution","command":"gh pr view 212 --repo OWNER/REPO --json mergeable -q .mergeable","aggregated_output":"MERGEABLE"}}
-{"type":"turn.completed","usage":{"input_tokens":5000,"output_tokens":10}}'
-
-# #214 — a command_execution whose OUTPUT (aggregated_output) merely contains the
-# literal substring "post-verdict.sh pass" (e.g. codex catting the prompt/SKILL.md
-# that documents the helper) but whose `command` is NOT a post-verdict invocation.
-# Must NOT converge — the match keys on the command shape, not any substring.
-POST_VERDICT_IN_OUTPUT_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"po0","type":"command_execution","command":"cat skills/autonomous-dev/SKILL.md","aggregated_output":"... post the verdict via: bash scripts/post-verdict.sh <issue> pass <file> ..."}}
-{"type":"turn.completed","usage":{"input_tokens":6000,"output_tokens":5}}'
-
-# #214 — a REAL post-verdict.sh invocation whose body-file PATH contains a `pass`/
-# `fail` PATH SEGMENT but with NO verdict positional arg (a malformed/aborted
-# invocation the agent could construct if it deviated from the suggested
-# /tmp/verdict-<agent>.md path). Must NOT converge — the verdict token is anchored
-# to its argument POSITION (after the issue-number positional), so a pass/fail
-# path segment appearing only in the body-file slot does not false-converge. This
-# is the fail-safe-toward-resuming guard (a `[^a-z0-9](pass|fail)[^a-z0-9]`
-# any-occurrence match would wrongly converge here and strand codex unavailable).
-POST_VERDICT_PASS_IN_PATH_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"pp0","type":"command_execution","command":"bash scripts/post-verdict.sh 212 /tmp/pass-notes.md codex sid","aggregated_output":""}}
-{"type":"turn.completed","usage":{"input_tokens":3000,"output_tokens":5}}'
-
-# #214 (#217 review finding) — a REAL post-verdict.sh invocation whose `command`
-# field contains an ESCAPED quote (`\"`) BEFORE the helper call, e.g. a chained
-# `printf '%s' \"text\" > file && bash scripts/post-verdict.sh 214 pass …`. JSON
-# escapes embedded quotes as `\"`; a naive truncate-at-first-`"` would cut the
-# command string at the escaped quote and DROP the helper invocation → the detector
-# false-NEGATIVES and the resume loop fires a DUPLICATE verdict (the very bug #214
-# fixes). The escape-aware command-field isolation must still see the helper call →
-# converge (rc 0). Note: the JSONL fragment uses \\\" so that after the shell
-# single-quote string and the awk read, the physical line carries a literal `\"`
-# (a backslash followed by a quote) inside the JSON command value, matching codex.
-POST_VERDICT_ESCAPED_QUOTE_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"eq0","type":"command_execution","command":"printf '\''%s'\'' \\"All checklist items verified\\" > /tmp/verdict-codex.md && bash scripts/post-verdict.sh 214 pass /tmp/verdict-codex.md codex sid","aggregated_output":"https://github.com/OWNER/REPO/issues/214#issuecomment-X"}}
-{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":50}}'
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 
 # ---------------------------------------------------------------------------
-echo "=== TC-CXR-DET: _codex_log_has_verdict_message ==="
+echo "=== TC-CXRS-CLS: _codex_review_classify_stdout ==="
 # ---------------------------------------------------------------------------
-TMPLOG=$(mktemp)
-trap 'rm -f "$TMPLOG"' EXIT
+F="$TMP/stdout.txt"
 
-# TC-CXR-DET-01 — last turn has an agent_message
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$VERDICT_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-01 verdict message in only turn → rc 0" 0 "$?"
+# TC-CXRS-CLS-01 — a [P1] finding → fail
+printf '%s\n' '[P1] src/x.ts:1 — silent failure.' > "$F"
+assert_eq "TC-CXRS-CLS-01 [P1] present → fail" "fail" "$(_codex_review_classify_stdout "$F")"
 
-# TC-CXR-DET-02 — only turn is gather-only
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$GATHER_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-02 gather-only turn → rc 1" 1 "$?"
+# TC-CXRS-CLS-02 — only [P2]/[P3] → pass
+printf '%s\n' '[P2] minor nit' '[P3] consider a test' > "$F"
+assert_eq "TC-CXRS-CLS-02 only [P2]/[P3] → pass" "pass" "$(_codex_review_classify_stdout "$F")"
 
-# TC-CXR-DET-03 — turn 1 gather-only, turn 2 has agent_message (last turn decides)
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$GATHER_TURN"; echo "$VERDICT_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-03 last turn has verdict msg → rc 0" 0 "$?"
+# TC-CXRS-CLS-03 — no priority markers at all → pass
+printf '%s\n' 'Looks good to merge. No issues.' > "$F"
+assert_eq "TC-CXRS-CLS-03 no markers → pass" "pass" "$(_codex_review_classify_stdout "$F")"
 
-# TC-CXR-DET-04 — turn 1 had agent_message, turn 2 gather-only (last turn decides)
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$VERDICT_TURN"; echo "$GATHER_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-04 last turn gather-only → rc 1" 1 "$?"
+# TC-CXRS-CLS-04 — empty stdout → pass (no [P1] ⇒ pass; wrapper still posts)
+: > "$F"
+assert_eq "TC-CXRS-CLS-04 empty → pass" "pass" "$(_codex_review_classify_stdout "$F")"
+# missing / empty-arg → pass, no crash
+assert_eq "TC-CXRS-CLS-04b missing file → pass" "pass" "$(_codex_review_classify_stdout "/nonexistent/$$")"
+assert_eq "TC-CXRS-CLS-04c empty arg → pass" "pass" "$(_codex_review_classify_stdout "")"
 
-# TC-CXR-DET-05 — empty / missing log never crashes
-: > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-05 empty log → rc 1" 1 "$?"
-_codex_log_has_verdict_message "/nonexistent/path/$$"; assert_eq "TC-CXR-DET-05b missing log → rc 1" 1 "$?"
+# TC-CXRS-CLS-05 — [P1] mid-line / multiple → fail (any occurrence)
+printf '%s\n' 'see [P1] here and another [P1] there' > "$F"
+assert_eq "TC-CXRS-CLS-05 multiple/mid-line [P1] → fail" "fail" "$(_codex_review_classify_stdout "$F")"
 
-# TC-CXR-DET-06 — agent_message present but NO trailing turn.completed (turn mid-flight)
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'
-  echo '{"type":"turn.started"}'
-  echo '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}'; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-06 no completed turn yet → rc 1" 1 "$?"
+# TC-CXRS-CLS-06 — [P1] inside a quoted block still counts (conservative)
+printf '%s\n' '```' 'the dev wrote: [P1] in a code comment' '```' > "$F"
+assert_eq "TC-CXRS-CLS-06 [P1] in quoted block → fail (conservative)" "fail" "$(_codex_review_classify_stdout "$F")"
 
-# TC-CXR-DET-07 — a turn emits agent_message but is KILLED before turn.completed
-# (per-turn cap fired mid-stream), then a later GATHER-ONLY turn completes. The
-# stale agent_message flag must NOT leak across the turn boundary — the LAST
-# COMPLETED turn is gather-only. Regression for the cur_msg-not-reset bug.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'
-  echo '{"type":"turn.started"}'
-  echo '{"type":"item.completed","item":{"type":"agent_message","text":"partial verdict"}}'
-  echo '{"type":"turn.started"}'
-  echo '{"type":"item.completed","item":{"type":"tool_call","name":"shell"}}'
-  echo '{"type":"turn.completed","usage":{"input_tokens":50000}}'; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-07 killed-mid-msg then gather-only completed → rc 1" 1 "$?"
+# TC-CXRS-CLS-07 — runs under set -euo pipefail without aborting (bare call)
+cls07=$(
+  set -euo pipefail
+  source "$LIB"
+  printf '%s\n' 'clean review' > "$F"
+  out=$(_codex_review_classify_stdout "$F")
+  echo "rc=$?|$out"
+)
+assert_eq "TC-CXRS-CLS-07 no abort under set -euo pipefail" "rc=0|pass" "$cls07"
 
-# TC-CXR-DET-08 — a tool_call turn whose OUTPUT text contains the literal
-# substring "type":"agent_message" (e.g. codex grepping its own JSONL log) must
-# NOT be mis-detected as a verdict turn. The narrowed regex requires the
-# agent_message type INSIDE the item object (`"item":{...}`), not anywhere on
-# the line. Regression for the substring false-positive (#189 review finding 2).
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'
-  echo '{"type":"turn.started"}'
-  echo '{"type":"item.completed","item":{"type":"tool_call","name":"shell","output":"grep hit: \"type\":\"agent_message\" in transcript"}}'
-  echo '{"type":"turn.completed","usage":{"input_tokens":5000}}'; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-08 tool-output substring not a false verdict → rc 1" 1 "$?"
-
-# TC-CXR-DET-09 — #198 ROOT CAUSE 2: the last completed turn emits agent_message
-# items that are PURE PROGRESS NARRATION (no verdict trailer). Convergence must
-# mean "codex posted the VERDICT", NOT "codex emitted any assistant message" —
-# so this is gather-only (rc 1) and the loop RESUMES. The pre-fix detector
-# (any-agent_message) returned rc 0 here and false-converged → no resume → the
-# poller found no verdict → codex dropped `unavailable`.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$NARRATION_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-09 narration-only turn (no verdict trailer) → rc 1 (resumes)" 1 "$?"
-
-# TC-CXR-DET-09b — the SAME shape from a captured real-world review-193 fixture
-# (sanitized; the issue mandates a committed fixture, not a /tmp log).
-_codex_log_has_verdict_message "$FIXTURES/codex-gather-only-turn.jsonl"
-assert_eq "TC-CXR-DET-09b review-193 gather-only fixture → rc 1 (resumes)" 1 "$?"
-
-# TC-CXR-DET-10 — a PASS verdict trailer in the last turn → converged (rc 0).
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$VERDICT_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-10 Review PASSED trailer → rc 0 (converged)" 0 "$?"
-
-# TC-CXR-DET-10b — a committed PASS-verdict fixture (Review PASSED + Review Agent: codex).
-_codex_log_has_verdict_message "$FIXTURES/codex-verdict-turn.jsonl"
-assert_eq "TC-CXR-DET-10b verdict fixture → rc 0 (converged)" 0 "$?"
-
-# TC-CXR-DET-11 — a FAIL verdict trailer (`Review findings:`) → converged (rc 0).
-# A failing verdict is still a verdict — codex posted its decision, do not resume.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$FAIL_VERDICT_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-11 Review findings: (FAIL verdict) → rc 0 (converged)" 0 "$?"
-
-# TC-CXR-DET-12 — the `Review Agent: codex` discriminator trailer alone → converged.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$AGENT_TRAILER_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-12 Review Agent: codex trailer → rc 0 (converged)" 0 "$?"
-
-# TC-CXR-DET-13 — last-turn-decides for the verdict-trailer rule: a verdict in an
-# EARLIER turn followed by a narration-only LAST turn must NOT count (rc 1). Pins
-# that the per-turn reset still applies to the new trailer match.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$VERDICT_TURN"; echo "$NARRATION_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-13 verdict then narration-only last turn → rc 1" 1 "$?"
-
-# TC-CXR-DET-14 — tool-output containing a verdict PHRASE (e.g. codex catting
-# SKILL.md / the prompt, whose text literally contains "Review PASSED") must NOT
-# be a false verdict — the phrase must be inside an agent_message item, not a
-# command_execution aggregated_output. Strengthens TC-CXR-DET-08 for the new
-# text-based match.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'
-  echo '{"type":"turn.started"}'
-  echo '{"type":"item.completed","item":{"type":"command_execution","command":"cat SKILL.md","aggregated_output":"... post a comment with Review PASSED on the first line ..."}}'
-  echo '{"type":"turn.completed","usage":{"input_tokens":5000}}'; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-14 verdict phrase in tool output not a false verdict → rc 1" 1 "$?"
-
-# TC-CXR-DET-15 — #214 CORE FIX: the last completed turn posts the verdict by
-# RUNNING `bash scripts/post-verdict.sh <issue> pass …` (a command_execution),
-# with NO verdict-trailer agent_message. Since INV-56 the verdict lands in a
-# command_execution, not an agent_message; the detector MUST converge (rc 0).
-# Pre-fix this returned rc 1 → the loop fired a redundant resume → codex
-# double-posted the verdict with a doubled trailer.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$POST_VERDICT_PASS_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-15 post-verdict.sh pass command → rc 0 (converged)" 0 "$?"
-
-# TC-CXR-DET-15b — the same shape from the committed fixture.
-_codex_log_has_verdict_message "$FIXTURES/codex-post-verdict-turn.jsonl"
-assert_eq "TC-CXR-DET-15b committed post-verdict fixture → rc 0 (converged)" 0 "$?"
-
-# TC-CXR-DET-16 — a `post-verdict.sh … fail …` command_execution (a failing
-# verdict via the helper) → converged (rc 0). A FAIL posted through the helper is
-# still a verdict; do not resume.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$POST_VERDICT_FAIL_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-16 post-verdict.sh fail command → rc 0 (converged)" 0 "$?"
-
-# TC-CXR-DET-17 — a narration agent_message that merely MENTIONS post-verdict.sh
-# ("Next I will run bash scripts/post-verdict.sh 212 pass …") with NO
-# command_execution invoking it and NO verdict trailer → NOT converged (rc 1).
-# The helper signal must be inside a command_execution item, not narration text.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$POST_VERDICT_NARRATION_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-17 post-verdict.sh mentioned in narration (not run) → rc 1" 1 "$?"
-
-# TC-CXR-DET-18 — a gather-only turn whose only command_execution is a non-verdict
-# command (`gh pr view … mergeable`) → NOT converged (rc 1). A non-post-verdict
-# command must never converge — the INV-53 narration/no-over-claim guard preserved.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$NON_VERDICT_CMD_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-18 non-verdict command_execution → rc 1 (no over-claim)" 1 "$?"
-
-# TC-CXR-DET-19 — a command_execution whose OUTPUT (aggregated_output) merely
-# contains the literal substring "post-verdict.sh pass" (codex catting the
-# prompt/SKILL.md that documents the helper) but whose `command` is NOT a
-# post-verdict invocation → NOT converged (rc 1). The match keys on the COMMAND
-# shape, not any substring on the line (false-positive guard, mirrors DET-08/14).
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$POST_VERDICT_IN_OUTPUT_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-19 post-verdict.sh substring in tool OUTPUT (not the command) → rc 1" 1 "$?"
-
-# TC-CXR-DET-20 — a REAL post-verdict.sh command whose body-file PATH has a
-# `pass`/`fail` path segment but NO verdict positional → NOT converged (rc 1). The
-# verdict token is anchored to its argument position (after the issue-number
-# positional), so a pass/fail-named path in the body-file slot must not
-# false-converge. Fail-safe-toward-resuming guard (codex review finding on #214).
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$POST_VERDICT_PASS_IN_PATH_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-20 pass/fail in body-file path, no verdict positional → rc 1" 1 "$?"
-
-# TC-CXR-DET-21 — #217 review finding: a REAL post-verdict.sh command whose `command`
-# field contains an ESCAPED quote (`\"`) BEFORE the helper call (a quoted prelude
-# chained with `&&`). The escape-aware command-field isolation must NOT truncate at
-# the escaped quote → still sees `post-verdict.sh 214 pass` → converged (rc 0). The
-# pre-fix `sub(/".*$/, "", cmd)` cut at the escaped quote and dropped the helper
-# invocation → rc 1 → would fire a DUPLICATE verdict (the very bug #214 fixes).
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$POST_VERDICT_ESCAPED_QUOTE_TURN"; } > "$TMPLOG"
-_codex_log_has_verdict_message "$TMPLOG"; assert_eq "TC-CXR-DET-21 escaped-quote prelude before post-verdict.sh → rc 0 (converged)" 0 "$?"
-
-# TC-CXR-DET-21b — the same shape from a committed fixture (sanitized; the issue
-# mandates a committed fixture, not only an inline string).
-_codex_log_has_verdict_message "$FIXTURES/codex-post-verdict-escaped-quote-turn.jsonl"
-assert_eq "TC-CXR-DET-21b committed escaped-quote fixture → rc 0 (converged)" 0 "$?"
+# fixture-backed
+assert_eq "TC-CXRS-CLS-08 p1 fixture → fail" "fail" "$(_codex_review_classify_stdout "$FIXTURES/codex-review-stdout-p1.txt")"
+assert_eq "TC-CXRS-CLS-09 clean fixture → pass" "pass" "$(_codex_review_classify_stdout "$FIXTURES/codex-review-stdout-clean.txt")"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== TC-CXR-DL: _codex_review_deadline_seconds ==="
+echo "=== TC-CXRS-BODY: _codex_review_compose_body ==="
 # ---------------------------------------------------------------------------
-assert_eq "TC-CXR-DL-01 1h → 3600"   3600  "$(AGENT_REVIEW_TIMEOUT=1h   _codex_review_deadline_seconds)"
-assert_eq "TC-CXR-DL-02 90m → 5400"  5400  "$(AGENT_REVIEW_TIMEOUT=90m  _codex_review_deadline_seconds)"
-assert_eq "TC-CXR-DL-03 120s → 120"  120   "$(AGENT_REVIEW_TIMEOUT=120s _codex_review_deadline_seconds)"
-assert_eq "TC-CXR-DL-04 1d → 86400"  86400 "$(AGENT_REVIEW_TIMEOUT=1d   _codex_review_deadline_seconds)"
-assert_eq "TC-CXR-DL-05 3600 bare → 3600" 3600 "$(AGENT_REVIEW_TIMEOUT=3600 _codex_review_deadline_seconds)"
-assert_eq "TC-CXR-DL-06a unset → 3600 default" 3600 "$(unset AGENT_REVIEW_TIMEOUT; _codex_review_deadline_seconds)"
-assert_eq "TC-CXR-DL-06b garbage → 3600 default" 3600 "$(AGENT_REVIEW_TIMEOUT=notaduration _codex_review_deadline_seconds)"
-assert_eq "TC-CXR-DL-06c empty → 3600 default" 3600 "$(AGENT_REVIEW_TIMEOUT='' _codex_review_deadline_seconds)"
+# TC-CXRS-BODY-01 — pass verdict, non-empty stdout → mentions codex review, no findings
+printf '%s\n' 'All good, no issues.' > "$F"
+body01=$(_codex_review_compose_body pass "$F")
+assert_contains "TC-CXRS-BODY-01a pass body mentions codex review" "codex review" "$body01"
+assert_contains "TC-CXRS-BODY-01b pass body carries the review output" "All good" "$body01"
+
+# TC-CXRS-BODY-02 — fail verdict, stdout with [P1] → body carries the findings text
+cp "$FIXTURES/codex-review-stdout-p1.txt" "$F"
+body02=$(_codex_review_compose_body fail "$F")
+assert_contains "TC-CXRS-BODY-02a fail body carries the [P1] finding" "[P1]" "$body02"
+assert_contains "TC-CXRS-BODY-02b fail body carries the finding text" "silent failure" "$body02"
+
+# TC-CXRS-BODY-03 — empty stdout, pass → non-empty default summary
+: > "$F"
+body03=$(_codex_review_compose_body pass "$F")
+assert_contains "TC-CXRS-BODY-03 empty stdout pass → non-empty default summary" "no blocking" "$body03"
+# empty stdout, fail → non-empty default
+body03b=$(_codex_review_compose_body fail "$F")
+assert_contains "TC-CXRS-BODY-03b empty stdout fail → non-empty default" "blocking" "$body03b"
+
+# TC-CXRS-BODY-04 — very large stdout → truncated under the cap (post-verdict.sh
+# rejects > 60000 chars; the helper caps at 50000 + a marker).
+head -c 70000 /dev/zero | tr '\0' 'x' > "$F"
+body04=$(_codex_review_compose_body fail "$F")
+if [[ ${#body04} -le 51000 ]]; then
+  echo -e "  ${GREEN}PASS${NC}: TC-CXRS-BODY-04a large stdout truncated under cap (len=${#body04})"; PASS=$((PASS + 1))
+else
+  echo -e "  ${RED}FAIL${NC}: TC-CXRS-BODY-04a large stdout NOT truncated (len=${#body04})"; FAIL=$((FAIL + 1))
+fi
+assert_contains "TC-CXRS-BODY-04b truncation marker present" "truncated" "$body04"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== TC-CXR-CTL: _run_codex_review_with_resume controller ==="
+echo "=== TC-CXRS-LAUNCH: _codex_review_argv (the codex review invocation shape) ==="
 # ---------------------------------------------------------------------------
-# Build a sandbox: a per-test temp dir with a recorder for run_agent /
-# resume_agent calls and a scripted JSONL feed. We stub run_agent /
-# resume_agent and the clock helper _codex_now_seconds so behavior is
-# deterministic. The controller writes the per-agent log to the path given by
-# the CODEX_REVIEW_LOG env var (the wrapper points this at $_agent_log).
+# _codex_review_argv populates a nameref OUT-ARRAY (no stdout): `_codex_review_argv
+# <out> <prompt> <model>`. We assert on the resulting bash array directly so a
+# multi-line prompt is verified to stay ONE element (the #218 finding-1 regression).
+# A per-element dump (NUL-joined → one line per element via tr) lets us count
+# elements and inspect each.
+argv_dump() { local -n _d="$1"; printf '%s\0' "${_d[@]}"; }   # NUL-delimited elements
 
-# run_codex_controller_case <feed-spec> <max-resumes> <now-script>
-#   feed-spec : newline-separated tokens, one per invocation: "gather" | "verdict"
-#               run_agent consumes token 1, each resume_agent consumes the next.
-#   now-script: newline-separated integers, one per _codex_now_seconds call.
-# Echoes "<rc>|<run_calls>|<resume_calls>" and writes resume argv recorder to
-# $REC_RESUME_ARGV.
-run_codex_controller_case() {
-  local feed="$1" max="$2" nowscript="$3"
+AGENT_DEV_EXTRA_ARGS="" _codex_review_argv argv_basic "my review prompt" ""
+# TC-CXRS-LAUNCH-01 — `review` is the subcommand and the prompt is the positional
+assert_eq "TC-CXRS-LAUNCH-01a argv[0] is the review subcommand" "review" "${argv_basic[0]}"
+assert_eq "TC-CXRS-LAUNCH-01b argv[1] is the prompt (one element)" "my review prompt" "${argv_basic[1]}"
+assert_eq "TC-CXRS-LAUNCH-01c no model/extra-args → exactly 2 elements" "2" "${#argv_basic[@]}"
+
+# TC-CXRS-LAUNCH-02/03 — model via -c model="...", NOT -m
+AGENT_DEV_EXTRA_ARGS="" _codex_review_argv argv_model "p" "openai.gpt-5.5"
+# join elements with a sentinel for substring/flag assertions
+argv_model_joined=$(IFS='|'; echo "${argv_model[*]}")
+assert_contains "TC-CXRS-LAUNCH-02 model passed via -c model=\"...\"" 'model="openai.gpt-5.5"' "$argv_model_joined"
+# the -c flag is its own element immediately before the model config element
+_mi=-1; for _k in "${!argv_model[@]}"; do [[ "${argv_model[$_k]}" == 'model="openai.gpt-5.5"' ]] && _mi=$_k; done
+if [[ "$_mi" -gt 0 && "${argv_model[$((_mi-1))]}" == "-c" ]]; then
+  echo -e "  ${GREEN}PASS${NC}: TC-CXRS-LAUNCH-02b the -c flag element precedes the model config element"; PASS=$((PASS + 1))
+else
+  echo -e "  ${RED}FAIL${NC}: TC-CXRS-LAUNCH-02b -c does not precede model config (idx=$_mi)"; FAIL=$((FAIL + 1))
+fi
+# TC-CXRS-LAUNCH-03 — NO -m element (codex review rejects it)
+_has_m=0; for _e in "${argv_model[@]}"; do [[ "$_e" == "-m" ]] && _has_m=1; done
+assert_eq "TC-CXRS-LAUNCH-03 argv has no bare -m element" "0" "$_has_m"
+# TC-CXRS-LAUNCH-04 — NO --base
+assert_not_contains "TC-CXRS-LAUNCH-04 argv has no --base" "--base" "$argv_model_joined"
+# TC-CXRS-LAUNCH-05 — NO --json
+assert_not_contains "TC-CXRS-LAUNCH-05 argv has no --json" "--json" "$argv_model_joined"
+# also no `exec` element (that is the DEV path)
+_has_exec=0; for _e in "${argv_model[@]}"; do [[ "$_e" == "exec" ]] && _has_exec=1; done
+assert_eq "TC-CXRS-LAUNCH-05b review argv has no 'exec' element" "0" "$_has_exec"
+
+# TC-CXRS-LAUNCH-06 — extra-args appended as DISTINCT elements (uses the real
+# _parse_extra_args via lib-agent.sh). `-s danger-full-access` → two elements.
+(
+  source "$AGENT_LIB" 2>/dev/null
+  source "$LIB"
+  AGENT_DEV_EXTRA_ARGS="-s danger-full-access" _codex_review_argv argv_xa "p" "m"
+  printf '%s\0' "${argv_xa[@]}"
+) > "$TMP/argv_xa.nul"
+# count elements + assert -s and its value are SEPARATE elements
+argv_xa_count=$(tr -cd '\0' < "$TMP/argv_xa.nul" | wc -c | tr -d ' ')
+if grep -qzF -- '-s' "$TMP/argv_xa.nul" && grep -qzF -- 'danger-full-access' "$TMP/argv_xa.nul"; then
+  echo -e "  ${GREEN}PASS${NC}: TC-CXRS-LAUNCH-06 extra-args appended as distinct elements (-s + value)"; PASS=$((PASS + 1))
+else
+  echo -e "  ${RED}FAIL${NC}: TC-CXRS-LAUNCH-06 extra-args not present as distinct elements"; FAIL=$((FAIL + 1))
+fi
+
+# TC-CXRS-LAUNCH-08 — #218 FINDING 1 REGRESSION: a MULTI-LINE prompt (the real
+# build_review_prompt heredoc shape) must remain a SINGLE argv element. The pre-fix
+# newline-serialized round-trip split it at every `\n` into many positionals →
+# codex review got bogus args and failed before reviewing. The nameref array MUST
+# keep it intact: argv[1] equals the full multi-line prompt, and the total element
+# count is unaffected by how many lines the prompt has.
+multiline_prompt=$'You are reviewing PR #219.\n\n## Step 0\nCheck mergeable.\n\n## Decision\nPost via post-verdict.sh.\nLine with "quotes" and $(subshell) and `backtick`.'
+AGENT_DEV_EXTRA_ARGS="" _codex_review_argv argv_ml "$multiline_prompt" "sonnet"
+assert_eq "TC-CXRS-LAUNCH-08a multi-line prompt stays ONE argv element" "$multiline_prompt" "${argv_ml[1]}"
+# review + prompt + (-c + model) = exactly 4 elements regardless of prompt newlines
+assert_eq "TC-CXRS-LAUNCH-08b multi-line prompt does not inflate the element count" "4" "${#argv_ml[@]}"
+# and argv[0] is still exactly `review`, argv[2]/[3] the model flag (prompt did not bleed)
+assert_eq "TC-CXRS-LAUNCH-08c argv[0] still 'review' after a multi-line prompt" "review" "${argv_ml[0]}"
+assert_eq "TC-CXRS-LAUNCH-08d argv[2] is '-c' (prompt did not split into positionals)" "-c" "${argv_ml[2]}"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== TC-CXRS-RUN: _run_codex_review launch + bounded re-run (subsumes #209) ==="
+# ---------------------------------------------------------------------------
+# Sandbox: stub _run_with_timeout to consume a scripted feed of per-run exit
+# codes (one per line) and write scripted stdout to the capture file. Stub the
+# clock for the wall-clock deadline.
+#
+# run_codex_review_case <feed-rc-spec> <max-reruns> <now-script> [stdout-token]
+#   feed-rc-spec : newline-separated integers, one rc per invocation.
+#   now-script   : newline-separated integers, one per _codex_now_seconds call.
+#   stdout-token : "verdict" writes a clean review, "stream" writes a stream error.
+# Echoes "<rc>|<run_count>".
+run_codex_review_case() {
+  local feed="$1" max="$2" nowscript="$3" tok="${4:-verdict}"
   local sandbox; sandbox=$(mktemp -d)
-  local log="$sandbox/agent.log"
   printf '%s\n' "$feed"      > "$sandbox/feed"
   printf '%s\n' "$nowscript" > "$sandbox/now"
-  : > "$sandbox/run_calls"; : > "$sandbox/resume_calls"; : > "$sandbox/resume_argv"
-
+  : > "$sandbox/runs"
   (
     source "$LIB"
-
-    _feed_next() {
-      local tok; tok=$(head -n1 "$sandbox/feed")
-      sed -i '1d' "$sandbox/feed" 2>/dev/null || true
-      if [[ "$tok" == "verdict" ]]; then
-        printf '%s\n' "$VERDICT_TURN" >> "$log"
-      elif [[ "$tok" == "postverdict" ]]; then
-        printf '%s\n' "$POST_VERDICT_PASS_TURN" >> "$log"
+    _run_with_timeout() {
+      echo "run" >> "$sandbox/runs"
+      # the capture file is the LAST positional via `> "$stdout_file"` in
+      # _one_codex_review_run; we cannot see it here, so write through the
+      # redirection the caller set: our stdout IS that file.
+      if [[ "$tok" == "stream" ]]; then
+        echo "error: stream disconnected before completion: server error"
       else
-        printf '%s\n' "$GATHER_TURN" >> "$log"
+        echo "review output line"
       fi
+      local rc; rc=$(head -n1 "$sandbox/feed"); sed -i '1d' "$sandbox/feed" 2>/dev/null || true
+      return "${rc:-0}"
     }
-
-    # Stub the agent primitives. We record ONE marker line per call (the
-    # session_id is the 1st positional arg) so the call count is a clean line
-    # count — the prompt ($2) is multiline, so it goes to a separate recorder.
-    run_agent() {
-      echo "run sid=$1" >> "$sandbox/run_calls"
-      _feed_next
-    }
-    resume_agent() {
-      echo "resume sid=$1" >> "$sandbox/resume_calls"
-      printf '%s\n---END---\n' "$2" >> "$sandbox/resume_argv"   # $2 == prompt
-      _feed_next
-    }
-    # Deterministic clock: pop one integer per call; reuse last when exhausted.
     _codex_now_seconds() {
       local n; n=$(head -n1 "$sandbox/now")
       [[ $(wc -l < "$sandbox/now") -gt 1 ]] && sed -i '1d' "$sandbox/now"
       printf '%s\n' "$n"
     }
-
-    CODEX_REVIEW_MAX_RESUMES="$max" CODEX_REVIEW_LOG="$log" AGENT_REVIEW_TIMEOUT=1h \
-      _run_codex_review_with_resume "sid-123" "review prompt" "model-x" "sess-name"
+    CODEX_REVIEW_MAX_RERUNS="$max" AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+      _run_codex_review "prompt" "model-x" "$sandbox/cap.txt"
     rc=$?
-    # Count marker lines only ('run sid=' / 'resume sid='). grep -c exits 1 on
-    # no match (returns 0), so avoid bare grep which breaks under set -e.
-    runs=$(grep -c '^run sid=' "$sandbox/run_calls" 2>/dev/null) || runs=0
-    resumes=$(grep -c '^resume sid=' "$sandbox/resume_calls" 2>/dev/null) || resumes=0
-    cp "$sandbox/resume_argv" "$REC_RESUME_ARGV" 2>/dev/null || true
-    cp "$sandbox/resume_calls" "$REC_RESUME_CALLS" 2>/dev/null || true
-    echo "${rc}|${runs}|${resumes}"
+    runs=$(grep -c '^run$' "$sandbox/runs" 2>/dev/null) || runs=0
+    echo "${rc}|${runs}"
   )
   rm -rf "$sandbox"
 }
 
-REC_RESUME_ARGV=$(mktemp)
-REC_RESUME_CALLS=$(mktemp)
-trap 'rm -f "$TMPLOG" "$REC_RESUME_ARGV" "$REC_RESUME_CALLS"' EXIT
+# TC-CXRS-RUN-01 — run 1 clean → 1 run, rc 0
+assert_eq "TC-CXRS-RUN-01 clean first run → 1 run, rc 0" "0|1" "$(run_codex_review_case $'0' 3 $'0\n10')"
 
-# TC-CXR-CTL-01 — turn 1 gather, turn 2 (resume) posts verdict → exactly 1 resume
-out=$(run_codex_controller_case $'gather\nverdict' 3 $'0\n10\n20\n30')
-assert_eq "TC-CXR-CTL-01 one gather then verdict → 1 run, 1 resume, rc 0" "0|1|1" "$out"
+# TC-CXRS-RUN-02 — run 1 non-zero, re-run clean → 2 runs, rc 0 (transient ridden out, #209)
+assert_eq "TC-CXRS-RUN-02 transient non-zero then clean → 2 runs, rc 0 (#209)" "0|2" "$(run_codex_review_case $'1\n0' 3 $'0\n10\n20\n30')"
 
-# TC-CXR-CTL-02 — turn 1 already verdict (small-diff happy path) → zero resumes
-out=$(run_codex_controller_case $'verdict' 3 $'0\n10')
-assert_eq "TC-CXR-CTL-02 immediate verdict → 1 run, 0 resume, rc 0" "0|1|0" "$out"
+# TC-CXRS-RUN-03 — every run non-zero, max=3 → 1 + 3 = 4 runs, returns last rc
+assert_eq "TC-CXRS-RUN-03 sustained failure max=3 → 4 runs, rc 1 (graceful)" "1|4" "$(run_codex_review_case $'1\n1\n1\n1' 3 $'0\n5\n10\n15\n20')"
 
-# TC-CXR-CTL-03 — every turn gather-only, max=3 → exactly 3 resumes then stop
-out=$(run_codex_controller_case $'gather\ngather\ngather\ngather' 3 $'0\n5\n10\n15\n20')
-assert_eq "TC-CXR-CTL-03 never converges, max=3 → 1 run, 3 resume (bounded)" "0|1|3" "$out"
+# TC-CXRS-RUN-04 — CODEX_REVIEW_MAX_RERUNS=0 disables re-run → 1 run only
+assert_eq "TC-CXRS-RUN-04 max=0 → 1 run, no re-run, rc 1" "1|1" "$(run_codex_review_case $'1\n0' 0 $'0\n5')"
 
-# TC-CXR-CTL-04 — deadline already passed before round 1 → zero resumes
-# now-script: first call (deadline base) 0, then a huge value so now >= deadline.
-out=$(run_codex_controller_case $'gather\ngather' 3 $'0\n999999')
-assert_eq "TC-CXR-CTL-04 wall-clock exceeded → 1 run, 0 resume (deadline guard)" "0|1|0" "$out"
-
-# TC-CXR-CTL-05 — resume prompt content (via the controller)
-run_codex_controller_case $'gather\nverdict' 3 $'0\n10\n20\n30' >/dev/null
-resume_prompt=$(cat "$REC_RESUME_ARGV")
-assert_contains "TC-CXR-CTL-05a resume prompt tells codex to reuse already-loaded context" \
-  "ALREADY loaded" "$resume_prompt"
-assert_contains "TC-CXR-CTL-05b resume prompt tells codex to post the verdict" \
-  "verdict" "$resume_prompt"
-
-# TC-CXR-CTL-06 — resume reuses the SAME dispatcher session_id
-run_codex_controller_case $'gather\nverdict' 3 $'0\n10\n20\n30' >/dev/null
-resume_call=$(cat "$REC_RESUME_CALLS")
-assert_contains "TC-CXR-CTL-06 resume_agent called with the same session_id sid-123" \
-  "sid-123" "$resume_call"
-
-# TC-CXR-CTL-07 — rc propagation: the controller returns the rc of the LAST
-# invocation. run_agent returns 9 (no resume fires on an immediate verdict).
-ctl07=$(
-  set -uo pipefail
-  source "$LIB"
-  sandbox=$(mktemp -d); log="$sandbox/agent.log"
-  run_agent() { printf '%s\n' "$VERDICT_TURN" >> "$log"; return 9; }
-  resume_agent() { return 0; }
-  CODEX_REVIEW_LOG="$log" CODEX_REVIEW_MAX_RESUMES=3 AGENT_REVIEW_TIMEOUT=1h \
-    _run_codex_review_with_resume sid p m n
-  echo "$?"
-  rm -rf "$sandbox"
-)
-assert_eq "TC-CXR-CTL-07 returns last invocation rc (run_agent=9, no resume)" 9 "$ctl07"
-
-# TC-CXR-CTL-08 — max=0 disables the loop entirely
-out=$(run_codex_controller_case $'gather\ngather' 0 $'0\n5')
-assert_eq "TC-CXR-CTL-08 max=0 → 1 run, 0 resume" "0|1|0" "$out"
-
-# TC-CXR-CTL-09 — a non-numeric CODEX_REVIEW_MAX_RESUMES must NOT crash the
-# subshell under set -euo pipefail (degrade-don't-crash, mirroring the deadline
-# parser). Regression for the "stale typo strands the issue in reviewing"
-# failure mode: turn 1 is GATHER-ONLY so the `(( resumes >= max ))` bound check
-# IS reached — under set -u, evaluating arithmetic against a non-numeric `max`
-# would abort the subshell (unbound variable) before the marker line below.
-# The garbage value must safely default so the loop runs its bound and returns.
-ctl09=$(
+# TC-CXRS-RUN-05 — non-numeric max degrades (no unbound-variable crash under set -u)
+run05=$(
   set -euo pipefail
   source "$LIB"
-  sandbox=$(mktemp -d); log="$sandbox/agent.log"
-  run_agent()    { printf '%s\n' "$GATHER_TURN" >> "$log"; return 0; }   # never converges
-  resume_agent() { printf '%s\n' "$GATHER_TURN" >> "$log"; return 0; }
-  CODEX_REVIEW_LOG="$log" CODEX_REVIEW_MAX_RESUMES="three" AGENT_REVIEW_TIMEOUT=1h \
-    _run_codex_review_with_resume sid p m n
-  echo "rc=$?"   # only printed if the bound check did NOT abort the subshell
+  sandbox=$(mktemp -d)
+  _run_with_timeout() { echo x; return 1; }   # always fail so the bound is reached
+  _codex_now_seconds() { printf '%s\n' 0; }   # deadline never reached (base 0, budget 3600)
+  _rc=0
+  # `|| _rc=$?` captures the (legitimately non-zero) return without set -e
+  # aborting before the echo — the point of this test is that the non-numeric
+  # max DEGRADES (the `(( reruns >= max ))` bound is reached) rather than crashing
+  # with an `unbound variable` error under set -u.
+  CODEX_REVIEW_MAX_RERUNS="three" AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review p m "$sandbox/cap.txt" || _rc=$?
+  echo "rc=${_rc}"
   rm -rf "$sandbox"
 ) 2>/dev/null
-assert_eq "TC-CXR-CTL-09 non-numeric max degrades (bound reached), no crash" "rc=0" "$ctl09"
+assert_eq "TC-CXRS-RUN-05 non-numeric max degrades (bound reached), no crash" "rc=1" "$run05"
 
-# TC-CXR-CTL-10 — turn-1 rc 124 + clean resume + bound-exhaustion → controller returns 124
-# (regression test for timeout rc lost across resumes).
-ctl10=$(
+# TC-CXRS-RUN-06 — wall-clock deadline already passed before re-run → no re-run
+# now-script: base 0, then a huge value so now >= deadline on the first bound check.
+assert_eq "TC-CXRS-RUN-06 wall-clock exceeded → 1 run, no re-run" "1|1" "$(run_codex_review_case $'1\n0' 3 $'0\n999999')"
+
+# TC-CXRS-RUN-07 — #218 review finding 4: a wall-clock-cap kill (124/137) STOPS the
+# loop IMMEDIATELY and returns the sticky veto rc with ZERO re-runs. The re-run loop
+# exists for transient stream errors, NOT for the per-run timeout cap — re-running a
+# capped run is pointless (the cap refires) and risks the duplicate-verdict /
+# partial-review hazard (each clean re-run is a fresh `codex review` that may
+# self-post). So a turn-1 124 → 1 run, 0 re-runs, returns 124 (INV-48 veto).
+# The pre-fix code keyed the loop break on the STICKY final_rc, so a 124 then a clean
+# re-run kept final_rc==124, never broke, and looped to MAX_RERUNS — exactly the
+# bug. This test now asserts the RUN COUNT (not just the return value) so the
+# loop-until-bound regression cannot return.
+run07=$(
   set -uo pipefail
   source "$LIB"
-  sandbox=$(mktemp -d); log="$sandbox/agent.log"
-  run_agent()    { printf '%s\n' "$GATHER_TURN" >> "$log"; return 124; }
-  resume_agent() { printf '%s\n' "$GATHER_TURN" >> "$log"; return 0; }
-  CODEX_REVIEW_LOG="$log" CODEX_REVIEW_MAX_RESUMES=2 AGENT_REVIEW_TIMEOUT=1h \
-    _run_codex_review_with_resume sid p m n
-  echo "$?"
+  sandbox=$(mktemp -d); : > "$sandbox/runs"
+  _run_with_timeout() { echo run >> "$sandbox/runs"; echo x; return 124; }
+  _codex_now_seconds() { printf '%s\n' 0; }
+  CODEX_REVIEW_MAX_RERUNS=3 AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review p m "$sandbox/cap.txt"; rc=$?
+  runs=$(grep -c '^run$' "$sandbox/runs" 2>/dev/null) || runs=0
+  echo "rc=${rc}|runs=${runs}"
   rm -rf "$sandbox"
 )
-assert_eq "TC-CXR-CTL-10 turn-1 rc 124 + clean resume + bound-exhaustion → returns 124" 124 "$ctl10"
+assert_eq "TC-CXRS-RUN-07 turn-1 timeout (124) → breaks immediately, 1 run, returns 124 (INV-48 veto)" \
+  "rc=124|runs=1" "$run07"
 
-# TC-CXR-CTL-11 — non-timeout launch failure (rc=1) → returns 1 immediately, no resumes
-ctl11=$(
+# TC-CXRS-RUN-07b — the bug scenario directly: turn-1 124, then (had the loop
+# continued) a CLEAN run. The loop MUST NOT issue that clean re-run — a 124
+# terminates the loop. Stub: run 1 → 124, any subsequent run → 0. Correct behavior
+# is exactly ONE run (the 124), so the clean rc-0 path is never reached → no extra
+# `codex review` invocation that could self-post a duplicate verdict.
+run07b=$(
   set -uo pipefail
   source "$LIB"
-  sandbox=$(mktemp -d); log="$sandbox/agent.log"
-  run_calls=0; resume_calls=0
-  run_agent()    { run_calls=$((run_calls + 1)); return 1; }
-  resume_agent() { resume_calls=$((resume_calls + 1)); return 0; }
-  CODEX_REVIEW_LOG="$log" CODEX_REVIEW_MAX_RESUMES=3 AGENT_REVIEW_TIMEOUT=1h \
-    _run_codex_review_with_resume sid p m n
-  echo "$?|${run_calls}|${resume_calls}"
+  sandbox=$(mktemp -d); ri=0; : > "$sandbox/runs"
+  _run_with_timeout() { ri=$((ri+1)); echo run >> "$sandbox/runs"; echo x; [[ $ri -eq 1 ]] && return 124 || return 0; }
+  _codex_now_seconds() { printf '%s\n' 0; }
+  CODEX_REVIEW_MAX_RERUNS=3 AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review p m "$sandbox/cap.txt"; rc=$?
+  runs=$(grep -c '^run$' "$sandbox/runs" 2>/dev/null) || runs=0
+  echo "rc=${rc}|runs=${runs}"
   rm -rf "$sandbox"
 )
-assert_eq "TC-CXR-CTL-11 non-timeout launch failure returns early with no resumes" "1|1|0" "$ctl11"
+assert_eq "TC-CXRS-RUN-07b timeout-then-(would-be-clean) → NO extra re-run; 1 run, rc 124 (no duplicate-verdict path)" \
+  "rc=124|runs=1" "$run07b"
 
-# TC-CXR-CTL-12 — a timeout on a RESUME turn (not just turn 1) is sticky through a
-# later clean resume + bound-exhaustion: turn-1 rc 0, resume-1 rc 124, resume-2
-# rc 0, max=2 → controller returns 124. Pins the sticky rule for a mid-loop
-# timeout, the stronger half of #189 review finding 1 (the INV-48 veto must not be
-# reset by a subsequent clean-but-no-verdict resume).
-ctl12=$(
+# TC-CXRS-RUN-07c — a 137 (--kill-after SIGKILL) timeout also breaks immediately.
+run07c=$(
   set -uo pipefail
   source "$LIB"
-  sandbox=$(mktemp -d); log="$sandbox/agent.log"
-  ri=0
-  run_agent()    { printf '%s\n' "$GATHER_TURN" >> "$log"; return 0; }
-  resume_agent() {
-    ri=$((ri + 1))
-    printf '%s\n' "$GATHER_TURN" >> "$log"
-    [[ $ri -eq 1 ]] && return 124 || return 0
-  }
-  CODEX_REVIEW_LOG="$log" CODEX_REVIEW_MAX_RESUMES=2 AGENT_REVIEW_TIMEOUT=1h \
-    _run_codex_review_with_resume sid p m n
-  echo "$?"
+  sandbox=$(mktemp -d); : > "$sandbox/runs"
+  _run_with_timeout() { echo run >> "$sandbox/runs"; echo x; return 137; }
+  _codex_now_seconds() { printf '%s\n' 0; }
+  CODEX_REVIEW_MAX_RERUNS=3 AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review p m "$sandbox/cap.txt"; rc=$?
+  runs=$(grep -c '^run$' "$sandbox/runs" 2>/dev/null) || runs=0
+  echo "rc=${rc}|runs=${runs}"
   rm -rf "$sandbox"
 )
-assert_eq "TC-CXR-CTL-12 mid-loop resume timeout sticky through clean resume → returns 124" 124 "$ctl12"
+assert_eq "TC-CXRS-RUN-07c turn-1 137 → breaks immediately, 1 run, returns 137 (INV-48 veto)" \
+  "rc=137|runs=1" "$run07c"
 
-# TC-CXR-CTL-13 — #214 CORE FIX (controller level): turn 1 posts the verdict via
-# `post-verdict.sh` (a command_execution, no verdict-trailer agent_message) → the
-# controller converges with ZERO resumes. This is the dup-prevention assertion:
-# pre-fix the detector missed the command_execution verdict, so ≥1 resume fired
-# (→ a second verdict comment). Must flip to 0 resumes after the fix.
-out=$(run_codex_controller_case $'postverdict' 3 $'0\n10')
-assert_eq "TC-CXR-CTL-13 turn-1 helper-posted verdict → 1 run, 0 resume, rc 0 (no dup)" "0|1|0" "$out"
+# TC-CXRS-RUN-07d — a re-run that ITSELF times out still stops + returns the veto:
+# turn-1 rc 1 (stream error) → re-run 1 rc 124 → break (timeout), 2 runs, rc 124.
+# Confirms a timeout occurring DURING the re-run loop terminates it (not only a
+# turn-1 timeout) and feeds the veto.
+run07d=$(
+  set -uo pipefail
+  source "$LIB"
+  sandbox=$(mktemp -d); ri=0; : > "$sandbox/runs"
+  _run_with_timeout() { ri=$((ri+1)); echo run >> "$sandbox/runs"; echo x; [[ $ri -eq 1 ]] && return 1 || return 124; }
+  _codex_now_seconds() { printf '%s\n' 0; }
+  CODEX_REVIEW_MAX_RERUNS=3 AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review p m "$sandbox/cap.txt"; rc=$?
+  runs=$(grep -c '^run$' "$sandbox/runs" 2>/dev/null) || runs=0
+  echo "rc=${rc}|runs=${runs}"
+  rm -rf "$sandbox"
+)
+assert_eq "TC-CXRS-RUN-07d stream-error then re-run TIMES OUT → stops at the timeout, 2 runs, rc 124" \
+  "rc=124|runs=2" "$run07d"
 
-# TC-CXR-CTL-14 — turn 1 gather-only, turn 2 (resume) posts the verdict via the
-# helper → exactly one resume then converge (no SECOND, redundant resume).
-out=$(run_codex_controller_case $'gather\npostverdict' 3 $'0\n10\n20\n30')
-assert_eq "TC-CXR-CTL-14 gather then helper-posted verdict → 1 run, 1 resume, rc 0" "0|1|1" "$out"
+# TC-CXRS-RUN-08 — the capture file holds codex review's clean stdout
+run08=$(
+  set -uo pipefail
+  source "$LIB"
+  sandbox=$(mktemp -d)
+  _run_with_timeout() { echo "REVIEW STDOUT MARKER"; return 0; }
+  _codex_now_seconds() { printf '%s\n' 0; }
+  CODEX_REVIEW_MAX_RERUNS=3 AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review p m "$sandbox/cap.txt"
+  cat "$sandbox/cap.txt"
+  rm -rf "$sandbox"
+)
+assert_contains "TC-CXRS-RUN-08 capture file holds codex review stdout" "REVIEW STDOUT MARKER" "$run08"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== TC-CXR-RP: _codex_resume_prompt content (context-compaction safety) ==="
+echo "=== TC-CXRS-DL: _codex_review_deadline_seconds (reused for the re-run bound) ==="
 # ---------------------------------------------------------------------------
-# #198 follow-up: the original resume prompt said "do NOT re-run git diff and do
-# NOT re-read files you already read" — an ABSOLUTE instruction. When codex's own
-# context is compacted between turns (the diff is no longer in its working
-# context), that absolute bar left codex unable to substantiate a verdict, so it
-# defensively posted a [BLOCKING] "review context unavailable" FAIL instead of a
-# real verdict (observed on the codex lane reviewing PR #199 itself). The prompt
-# must instead PREFER reusing already-loaded context but ALLOW re-reading the
-# minimum needed when that context is gone — and must NEVER tell codex to refuse a
-# verdict for lack of context.
-rp=$(_codex_resume_prompt "sess-uuid-xyz")
-
-# TC-CXR-RP-01 — the prompt no longer contains the ABSOLUTE "do NOT re-read files"
-# bar (the instruction that stranded a compacted turn).
-if [[ "$rp" == *"do NOT re-read"* || "$rp" == *"do not re-read"* ]]; then
-  echo -e "  ${RED}FAIL${NC}: TC-CXR-RP-01 prompt must not contain an absolute 'do NOT re-read' bar"
-  FAIL=$((FAIL + 1))
-else
-  echo -e "  ${GREEN}PASS${NC}: TC-CXR-RP-01 no absolute 'do NOT re-read' bar"
-  PASS=$((PASS + 1))
-fi
-
-# TC-CXR-RP-02 — the prompt explicitly ALLOWS re-reading when context is gone.
-assert_contains "TC-CXR-RP-02 prompt allows re-reading when context is unavailable" \
-  "re-read" "$rp"
-
-# TC-CXR-RP-03 — the prompt still prefers reusing already-loaded context (avoid
-# gratuitous re-gather on the common path).
-assert_contains "TC-CXR-RP-03 prompt prefers already-loaded context" \
-  "ALREADY loaded" "$rp"
-
-# TC-CXR-RP-04 — the prompt instructs codex to ISSUE a verdict, not to refuse one
-# for lack of context (the defensive-bail the codex lane produced).
-assert_contains "TC-CXR-RP-04a prompt tells codex to post a verdict" \
-  "post your verdict" "$rp"
-assert_contains "TC-CXR-RP-04b prompt names the never-refuse rule" \
-  "do NOT refuse" "$rp"
-
-# TC-CXR-RP-05 — the session uuid is still present (codex interpolates it as the
-# post-verdict.sh session arg). The HAND-WRITTEN `Review Agent: codex` trailer
-# directive is dropped in #214 (see RP-07) — the helper writes that line now — so
-# the only place the uuid appears is the post-verdict.sh argument guidance.
-assert_contains "TC-CXR-RP-05 prompt carries the session uuid" \
-  "sess-uuid-xyz" "$rp"
-
-# --- #214: resume prompt routes the verdict through post-verdict.sh, no hand-
-# written trailer (so a legitimately-posted resume verdict can't double-trailer) -
-# TC-CXR-RP-06 — the prompt instructs posting via the INV-56 helper.
-assert_contains "TC-CXR-RP-06 resume prompt instructs posting via post-verdict.sh" \
-  "post-verdict.sh" "$rp"
-
-# TC-CXR-RP-07 — the prompt no longer tells codex to hand-write the
-# `Review Agent:` / `Review Session:` trailer. The pre-INV-56 prompt said the
-# verdict comment "MUST include these two lines verbatim" followed by a literal
-# `Review Agent: codex` directive line for codex to copy; that produced the
-# DOUBLED trailer when stacked on the helper's own trailer. Assert BOTH the
-# "include these two lines verbatim" directive AND a standalone hand-write
-# `Review Agent: codex` instruction line are gone. (The string `post-verdict.sh`
-# may legitimately mention the agent name as an argument; we only forbid the
-# verbatim-trailer DIRECTIVE.)
-if [[ "$rp" == *"verbatim"* ]]; then
-  echo -e "  ${RED}FAIL${NC}: TC-CXR-RP-07a prompt must not tell codex to include the trailer verbatim (the helper writes it)"
-  FAIL=$((FAIL + 1))
-else
-  echo -e "  ${GREEN}PASS${NC}: TC-CXR-RP-07a no 'verbatim' hand-write-trailer directive"
-  PASS=$((PASS + 1))
-fi
-assert_not_contains "TC-CXR-RP-07b prompt does NOT carry a hand-written 'Review Session:' trailer directive" \
-  "Review Session: \${session_uuid}" "$rp"
-
-# TC-CXR-RP-08 — the body phrasing guidance (Review PASSED / Review findings:)
-# survives so codex still produces a classifiable body for the helper.
-assert_contains "TC-CXR-RP-08a prompt keeps the PASS body phrasing" \
-  "Review PASSED" "$rp"
-assert_contains "TC-CXR-RP-08b prompt keeps the FAIL body phrasing" \
-  "Review findings:" "$rp"
+assert_eq "TC-CXRS-DL-01 1h → 3600"   3600  "$(AGENT_REVIEW_TIMEOUT=1h   _codex_review_deadline_seconds)"
+assert_eq "TC-CXRS-DL-02 90m → 5400"  5400  "$(AGENT_REVIEW_TIMEOUT=90m  _codex_review_deadline_seconds)"
+assert_eq "TC-CXRS-DL-03 garbage → 3600 default" 3600 "$(AGENT_REVIEW_TIMEOUT=notaduration _codex_review_deadline_seconds)"
+assert_eq "TC-CXRS-DL-04 unset → 3600 default" 3600 "$(unset AGENT_REVIEW_TIMEOUT; _codex_review_deadline_seconds)"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== TC-CXR-ISO: isolation + wrapper wiring (source-of-truth) ==="
+echo "=== TC-CXRS-DROP: stdout-based stream-error drop reason (re-scoped INV-59) ==="
 # ---------------------------------------------------------------------------
-# TC-CXR-ISO-02 — fan-out routes codex through the resume controller, guarded.
-assert_grep "TC-CXR-ISO-02a wrapper calls _run_codex_review_with_resume" \
+DF="$TMP/drop.txt"
+
+# _codex_review_has_stream_error
+cp "$FIXTURES/codex-review-stdout-stream-error.txt" "$DF"
+_codex_review_has_stream_error "$DF"; assert_eq "TC-CXRS-DROP-01 stream-error capture → rc 0" 0 "$?"
+cp "$FIXTURES/codex-review-stdout-clean.txt" "$DF"
+_codex_review_has_stream_error "$DF"; assert_eq "TC-CXRS-DROP-02 clean review → rc 1 (no over-claim)" 1 "$?"
+cp "$FIXTURES/codex-review-stdout-p1.txt" "$DF"
+_codex_review_has_stream_error "$DF"; assert_eq "TC-CXRS-DROP-03 [P1] review → rc 1 (no over-claim)" 1 "$?"
+: > "$DF"
+_codex_review_has_stream_error "$DF"; assert_eq "TC-CXRS-DROP-04a empty → rc 1" 1 "$?"
+_codex_review_has_stream_error "/nonexistent/$$"; assert_eq "TC-CXRS-DROP-04b missing → rc 1" 1 "$?"
+_codex_review_has_stream_error ""; assert_eq "TC-CXRS-DROP-04c empty arg → rc 1" 1 "$?"
+
+# _classify_codex_drop_reason
+cp "$FIXTURES/codex-review-stdout-stream-error.txt" "$DF"
+assert_eq "TC-CXRS-DROP-05 ladder + disconnect → stream-error:5/5" \
+  "stream-error:5/5" "$(_classify_codex_drop_reason "$DF")"
+# disconnect, no ladder → bare stream-error
+printf '%s\n' 'error: stream disconnected before completion: server error' > "$DF"
+assert_eq "TC-CXRS-DROP-06 disconnect no ladder → stream-error" \
+  "stream-error" "$(_classify_codex_drop_reason "$DF")"
+cp "$FIXTURES/codex-review-stdout-clean.txt" "$DF"
+assert_eq "TC-CXRS-DROP-07 clean review → empty (caller keeps bare unavailable)" \
+  "" "$(_classify_codex_drop_reason "$DF")"
+cp "$FIXTURES/codex-review-stdout-p1.txt" "$DF"
+assert_eq "TC-CXRS-DROP-08 [P1] review → empty (not a stream error)" \
+  "" "$(_classify_codex_drop_reason "$DF")"
+assert_eq "TC-CXRS-DROP-09a missing → empty" "" "$(_classify_codex_drop_reason "/nonexistent/$$")"
+assert_eq "TC-CXRS-DROP-09b empty arg → empty" "" "$(_classify_codex_drop_reason "")"
+
+# fail-safe under set -euo pipefail with a no-ladder stream error (BARE call)
+drop10=$(
+  set -euo pipefail
+  source "$LIB"
+  printf '%s\n' 'error: stream disconnected before completion: server error' > "$DF"
+  _classify_codex_drop_reason "$DF"
+  echo "REACHED_RETURN_0"
+)
+assert_eq "TC-CXRS-DROP-10 bare call, no-ladder stream error → no errexit abort" \
+  $'stream-error\nREACHED_RETURN_0' "$drop10"
+
+# _codex_drop_reason_phrase
+phr1=$(_codex_drop_reason_phrase "stream-error:5/5")
+assert_contains "TC-CXRS-DROP-11a phrase names stream-error" "stream-error" "$phr1"
+assert_contains "TC-CXRS-DROP-11b phrase carries ladder depth" "5/5" "$phr1"
+phr2=$(_codex_drop_reason_phrase "stream-error")
+assert_not_contains "TC-CXRS-DROP-12 no spurious depth when no ladder" "5/5" "$phr2"
+assert_eq "TC-CXRS-DROP-13 empty token → empty phrase" "" "$(_codex_drop_reason_phrase "")"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== TC-CXRS-DEV: codex DEV path stays on 'codex exec' (byte-for-byte) ==="
+# ---------------------------------------------------------------------------
+# The dev primitives live in lib-agent.sh and must NOT learn about `codex review`.
+assert_grep "TC-CXRS-DEV-01 dev codex branch still emits 'codex exec --json'" \
+  '"\$AGENT_CMD" exec --json' "$AGENT_LIB"
+assert_no_grep "TC-CXRS-DEV-02 lib-agent.sh has no 'codex review' / review-lib leak" \
+  'codex review|_run_codex_review|_codex_review_' "$AGENT_LIB"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== TC-CXRS-WIRE: wrapper wiring (source-of-truth) ==="
+# ---------------------------------------------------------------------------
+# TC-CXRS-WIRE-01 — fan-out codex branch calls _run_codex_review
+assert_grep "TC-CXRS-WIRE-01 wrapper calls _run_codex_review" \
+  '_run_codex_review ' "$WRAPPER"
+# TC-CXRS-WIRE-02 — the old resume controller is GONE (lib + wrapper)
+assert_no_grep "TC-CXRS-WIRE-02a _run_codex_review_with_resume removed from wrapper" \
   '_run_codex_review_with_resume' "$WRAPPER"
-assert_grep "TC-CXR-ISO-02b codex routing is guarded on the per-agent CMD == codex" \
-  '(AGENT_CMD|_agent).*=.*codex' "$WRAPPER"
-# TC-CXR-ISO-03 — non-codex still routes through bare run_agent.
-assert_grep "TC-CXR-ISO-03 bare run_agent retained for non-codex agents" \
+assert_no_grep "TC-CXRS-WIRE-02b _run_codex_review_with_resume removed from lib" \
+  '_run_codex_review_with_resume' "$LIB"
+# TC-CXRS-WIRE-03 — the JSONL verdict parser is GONE
+assert_no_grep "TC-CXRS-WIRE-03a _codex_log_has_verdict_message removed from lib" \
+  '_codex_log_has_verdict_message' "$LIB"
+assert_no_grep "TC-CXRS-WIRE-03b _codex_log_has_verdict_message removed from wrapper" \
+  '_codex_log_has_verdict_message' "$WRAPPER"
+# TC-CXRS-WIRE-04 — the INV-55 inline-diff block is GONE from the codex prompt
+assert_no_grep "TC-CXRS-WIRE-04a DIFF_START_ inline-diff marker removed" \
+  'DIFF_START_' "$WRAPPER"
+assert_no_grep "TC-CXRS-WIRE-04b DIFF_END_ inline-diff marker removed" \
+  'DIFF_END_' "$WRAPPER"
+assert_no_grep "TC-CXRS-WIRE-04c the gh pr diff inline-fetch for codex removed" \
+  'CODEX_REVIEW_INLINE_DIFF_MAX_BYTES' "$WRAPPER"
+# TC-CXRS-WIRE-05 — non-codex agents still route through bare run_agent
+assert_grep "TC-CXRS-WIRE-05 bare run_agent retained for non-codex agents" \
   'run_agent "\$_agent_session_id"' "$WRAPPER"
-# TC-CXR-ISO-04 — wrapper sources the new lib.
-assert_grep "TC-CXR-ISO-04 wrapper sources lib-review-codex.sh" \
-  'source "\$\{SCRIPT_DIR\}/lib-review-codex.sh"' "$WRAPPER"
-# TC-CXR-ISO-06 — CI shellcheck job lists the new lib.
-assert_grep "TC-CXR-ISO-06 CI shellcheck includes lib-review-codex.sh" \
-  'lib-review-codex.sh' "$CI"
-
-# ===========================================================================
-# INV-59 (#209): codex transient stream-error retry + drop reason
-# ===========================================================================
-# A codex review member whose model stream dies with an upstream 5xx exhausts
-# its 5/5 SSE reconnects and emits turn.failed. Pre-#209 the wrapper dropped it
-# as an opaque `unavailable` with no reason, and a launch-level turn.failed
-# early-returned from the resume loop so a brief blip was never ridden out.
-# These tests pin the codex-shaped drop-reason classifier (mirroring agy's
-# INV-58) + the resume-loop's transient-stream-error retry.
-
-# Scripted JSONL turn fragments for the stream-error path -----------------
-# A turn.failed preceded by the full Reconnecting... N/5 ladder (the live
-# repro: codex's CLI retries the SSE stream 5 times then fails the turn).
-STREAM_ERROR_TURN='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"s0","type":"command_execution","command":"gh pr view 209 --json mergeable","aggregated_output":"MERGEABLE"}}
-{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: The server had an error while processing your request. Sorry about that!)"}
-{"type":"error","message":"Reconnecting... 5/5 (stream disconnected before completion: The server had an error while processing your request. Sorry about that!)"}
-{"type":"turn.failed","error":{"message":"stream disconnected before completion: The server had an error while processing your request. Sorry about that!"}}'
-
-# A turn.failed with the stream-error message but NO Reconnecting ladder
-# visible (e.g. the ladder rolled off / a single-shot failure).
-STREAM_FAIL_NO_LADDER='{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"sf0","type":"reasoning","text":"loading diff"}}
-{"type":"turn.failed","error":{"message":"stream disconnected before completion: The server had an error while processing your request."}}'
-
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== TC-CODEX-DROP-DET: _codex_log_has_stream_error ==="
-# ---------------------------------------------------------------------------
-DLOG=$(mktemp)
-trap 'rm -f "$TMPLOG" "$REC_RESUME_ARGV" "$REC_RESUME_CALLS" "$DLOG"' EXIT
-
-# TC-CODEX-DROP-DET-01 — full Reconnecting ladder + turn.failed → stream error
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$STREAM_ERROR_TURN"; } > "$DLOG"
-_codex_log_has_stream_error "$DLOG"; assert_eq "TC-CODEX-DROP-DET-01 ladder + turn.failed → rc 0 (stream error)" 0 "$?"
-
-# TC-CODEX-DROP-DET-02 — a clean gather/narration turn (#198 case) → NO stream error
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$NARRATION_TURN"; } > "$DLOG"
-_codex_log_has_stream_error "$DLOG"; assert_eq "TC-CODEX-DROP-DET-02 clean no-verdict turn → rc 1 (no over-claim)" 1 "$?"
-
-# TC-CODEX-DROP-DET-03 — a clean verdict turn → NO stream error
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$VERDICT_TURN"; } > "$DLOG"
-_codex_log_has_stream_error "$DLOG"; assert_eq "TC-CODEX-DROP-DET-03 verdict turn → rc 1 (no stream error)" 1 "$?"
-
-# TC-CODEX-DROP-DET-04 — turn.failed stream error, no ladder → stream error
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$STREAM_FAIL_NO_LADDER"; } > "$DLOG"
-_codex_log_has_stream_error "$DLOG"; assert_eq "TC-CODEX-DROP-DET-04 turn.failed (no ladder) → rc 0" 0 "$?"
-
-# TC-CODEX-DROP-DET-05 — empty / missing / empty-arg log → rc 1, no crash
-: > "$DLOG"
-_codex_log_has_stream_error "$DLOG"; assert_eq "TC-CODEX-DROP-DET-05a empty log → rc 1" 1 "$?"
-_codex_log_has_stream_error "/nonexistent/path/$$"; assert_eq "TC-CODEX-DROP-DET-05b missing log → rc 1" 1 "$?"
-_codex_log_has_stream_error ""; assert_eq "TC-CODEX-DROP-DET-05c empty arg → rc 1" 1 "$?"
-
-# TC-CODEX-DROP-DET-06 — a tool-output line whose text merely contains the
-# literal substring "turn.failed" (codex grepping its own JSONL log) must NOT be
-# mis-detected. The detector keys on the EVENT type, not any substring on the
-# line. Mirrors TC-CXR-DET-08 for the verdict detector.
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'
-  echo '{"type":"turn.started"}'
-  echo '{"type":"item.completed","item":{"type":"tool_call","name":"shell","output":"grep hit: \"type\":\"turn.failed\" in transcript"}}'
-  echo '{"type":"turn.completed","usage":{"input_tokens":5000}}'; } > "$DLOG"
-_codex_log_has_stream_error "$DLOG"; assert_eq "TC-CODEX-DROP-DET-06 tool-output substring not a false stream error → rc 1" 1 "$?"
-
-# TC-CODEX-DROP-DET-07 — committed fixture (sanitized real codex stream-error log).
-_codex_log_has_stream_error "$FIXTURES/codex-stream-error-turn.jsonl"
-assert_eq "TC-CODEX-DROP-DET-07 committed stream-error fixture → rc 0" 0 "$?"
-
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== TC-CODEX-DROP-CLS: _classify_codex_drop_reason ==="
-# ---------------------------------------------------------------------------
-# TC-CODEX-DROP-CLS-01 — ladder + turn.failed → stream-error:5/5 (ladder depth)
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$STREAM_ERROR_TURN"; } > "$DLOG"
-assert_eq "TC-CODEX-DROP-CLS-01 ladder + turn.failed → stream-error:5/5" \
-  "stream-error:5/5" "$(_classify_codex_drop_reason "$DLOG")"
-
-# TC-CODEX-DROP-CLS-02 — turn.failed, no ladder → bare stream-error
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$STREAM_FAIL_NO_LADDER"; } > "$DLOG"
-assert_eq "TC-CODEX-DROP-CLS-02 turn.failed no ladder → stream-error" \
-  "stream-error" "$(_classify_codex_drop_reason "$DLOG")"
-
-# TC-CODEX-DROP-CLS-03 — clean no-verdict turn (#198) → empty (no over-claim)
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$NARRATION_TURN"; } > "$DLOG"
-assert_eq "TC-CODEX-DROP-CLS-03 clean no-verdict turn → empty (caller keeps bare unavailable)" \
-  "" "$(_classify_codex_drop_reason "$DLOG")"
-
-# TC-CODEX-DROP-CLS-04 — verdict turn → empty
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$VERDICT_TURN"; } > "$DLOG"
-assert_eq "TC-CODEX-DROP-CLS-04 verdict turn → empty" \
-  "" "$(_classify_codex_drop_reason "$DLOG")"
-
-# TC-CODEX-DROP-CLS-05 — empty / missing / empty-arg → empty, no crash
-: > "$DLOG"
-assert_eq "TC-CODEX-DROP-CLS-05a empty log → empty" "" "$(_classify_codex_drop_reason "$DLOG")"
-assert_eq "TC-CODEX-DROP-CLS-05b missing log → empty" "" "$(_classify_codex_drop_reason "/nonexistent/path/$$")"
-assert_eq "TC-CODEX-DROP-CLS-05c empty arg → empty" "" "$(_classify_codex_drop_reason "")"
-
-# TC-CODEX-DROP-CLS-06 — runs cleanly under set -euo pipefail (no abort)
-cls06=$(
-  set -euo pipefail
-  source "$LIB"
-  printf '%s\n' "$STREAM_ERROR_TURN" > "$DLOG"
-  out=$(_classify_codex_drop_reason "$DLOG")
-  echo "rc=$?|$out"
-)
-assert_eq "TC-CODEX-DROP-CLS-06 no crash under set -euo pipefail" \
-  "rc=0|stream-error:5/5" "$cls06"
-
-# TC-CODEX-DROP-CLS-07 — committed fixture → stream-error:5/5
-assert_eq "TC-CODEX-DROP-CLS-07 committed fixture → stream-error:5/5" \
-  "stream-error:5/5" "$(_classify_codex_drop_reason "$FIXTURES/codex-stream-error-turn.jsonl")"
-
-# TC-CODEX-DROP-CLS-08 — fail-safe contract holds for a BARE call (not in a
-# command substitution) under `set -euo pipefail` with a turn.failed stream
-# error that carries NO reconnect ladder. This is the path CLS-06 cannot cover:
-# CLS-06 calls the classifier inside `out=$(…)`, which suppresses errexit for the
-# function body, AND it uses a log WITH a ladder so the inner ladder pipeline
-# matches and exits 0 anyway. Only a BARE call + a NO-LADDER log exercises the
-# ladder-extraction pipeline's grep-no-match rc 1 under pipefail at the function's
-# own errexit scope — the function MUST still reach its `return 0`. A regression
-# guard: the helper's docstring promises "rc 0 ALWAYS — fail-safe under
-# `set -euo pipefail`", so an unprotected pipeline that aborts before `return 0`
-# is a contract violation (codex review finding on PR #211).
-cls08=$(
-  set -euo pipefail
-  source "$LIB"
-  printf '%s\n' "$STREAM_FAIL_NO_LADDER" > "$DLOG"
-  _classify_codex_drop_reason "$DLOG"   # BARE call — errexit applies to the body
-  echo "REACHED_RETURN_0"               # only prints if the function did not abort
-)
-assert_eq "TC-CODEX-DROP-CLS-08 bare call, no-ladder stream error → no errexit abort" \
-  $'stream-error\nREACHED_RETURN_0' "$cls08"
-
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== TC-CODEX-DROP-PHR: _codex_drop_reason_phrase ==="
-# ---------------------------------------------------------------------------
-cphr01=$(_codex_drop_reason_phrase "stream-error:5/5")
-assert_contains "TC-CODEX-DROP-PHR-01a phrase names stream-error" "stream-error" "$cphr01"
-assert_contains "TC-CODEX-DROP-PHR-01b phrase carries the reconnect ladder depth" "5/5" "$cphr01"
-assert_contains "TC-CODEX-DROP-PHR-01c phrase mentions reconnects" "reconnect" "$cphr01"
-
-cphr02=$(_codex_drop_reason_phrase "stream-error")
-assert_contains "TC-CODEX-DROP-PHR-02a phrase names stream-error (no depth)" "stream-error" "$cphr02"
-assert_not_contains "TC-CODEX-DROP-PHR-02b no spurious '5/5' when no ladder depth" "5/5" "$cphr02"
-
-assert_eq "TC-CODEX-DROP-PHR-03 empty token → empty phrase" "" "$(_codex_drop_reason_phrase "")"
-
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== TC-CODEX-DROP-RETRY: resume loop rides out a transient stream error ==="
-# ---------------------------------------------------------------------------
-# The pre-#209 controller early-returns when turn 1's rc is non-zero AND not
-# 124/137 — so a launch-level turn.failed stream error never entered the resume
-# loop. The fix: a non-zero/non-timeout rc WITH a fresh stream-error signal in
-# the log must NOT early-return; it falls through to the bounded resume loop so a
-# brief blip is ridden out. A genuine non-stream launch failure still
-# early-returns (unchanged). A sustained outage exhausts the bound (graceful).
-
-# TC-CODEX-DROP-RETRY-01 — turn 1 rc 1 WITH a stream error, resume posts verdict
-# → enters the loop, ≥1 resume fires, converges to rc 0. run_agent appends a
-# stream-error turn and returns 1; resume_agent appends a verdict turn.
-retry01=$(
-  set -uo pipefail
-  source "$LIB"
-  sandbox=$(mktemp -d); log="$sandbox/agent.log"
-  rc1=0; res=0
-  run_agent()    { printf '%s\n' "$STREAM_ERROR_TURN" >> "$log"; return 1; }
-  resume_agent() { res=$((res+1)); printf '%s\n' "$VERDICT_TURN" >> "$log"; return 0; }
-  CODEX_REVIEW_LOG="$log" CODEX_REVIEW_MAX_RESUMES=3 AGENT_REVIEW_TIMEOUT=1h \
-    _run_codex_review_with_resume sid p m n
-  rc=$?
-  echo "$rc|$res"
-  rm -rf "$sandbox"
-)
-assert_eq "TC-CODEX-DROP-RETRY-01 turn-1 stream-error rc1 + verdict resume → enters loop, converges (rc 0, ≥1 resume)" "0|1" "$retry01"
-
-# TC-CODEX-DROP-RETRY-02 — turn 1 rc 1 WITHOUT a stream error (genuine launch
-# failure) → early-returns rc 1 with 0 resumes (unchanged behavior). run_agent
-# writes NOTHING to the log (no stream error) and returns 1.
-retry02=$(
-  set -uo pipefail
-  source "$LIB"
-  sandbox=$(mktemp -d); log="$sandbox/agent.log"; : > "$log"
-  run_calls=0; resume_calls=0
-  run_agent()    { run_calls=$((run_calls+1)); return 1; }
-  resume_agent() { resume_calls=$((resume_calls+1)); return 0; }
-  CODEX_REVIEW_LOG="$log" CODEX_REVIEW_MAX_RESUMES=3 AGENT_REVIEW_TIMEOUT=1h \
-    _run_codex_review_with_resume sid p m n
-  echo "$?|${run_calls}|${resume_calls}"
-  rm -rf "$sandbox"
-)
-assert_eq "TC-CODEX-DROP-RETRY-02 genuine launch failure (no stream error) early-returns, 0 resumes" "1|1|0" "$retry02"
-
-# TC-CODEX-DROP-RETRY-03 — sustained: turn 1 rc 1 with a stream error, EVERY
-# resume also fails with a stream error, max=2 → enters the loop, exhausts the
-# bound (exactly 2 resumes), then degrades — no infinite retry.
-retry03=$(
-  set -uo pipefail
-  source "$LIB"
-  sandbox=$(mktemp -d); log="$sandbox/agent.log"
-  res=0
-  run_agent()    { printf '%s\n' "$STREAM_ERROR_TURN" >> "$log"; return 1; }
-  resume_agent() { res=$((res+1)); printf '%s\n' "$STREAM_ERROR_TURN" >> "$log"; return 1; }
-  CODEX_REVIEW_LOG="$log" CODEX_REVIEW_MAX_RESUMES=2 AGENT_REVIEW_TIMEOUT=1h \
-    _run_codex_review_with_resume sid p m n
-  rc=$?
-  echo "$res"
-  rm -rf "$sandbox"
-)
-assert_eq "TC-CODEX-DROP-RETRY-03 sustained stream error, max=2 → bounded (exactly 2 resumes)" "2" "$retry03"
-
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== TC-CODEX-DROP-LOOP: drop-reason augmentation loop (behavioral) ==="
-# ---------------------------------------------------------------------------
-# Mirror the wrapper's per-agent _dropped_reasons loop body verbatim against the
-# real libs (agy + codex). This is the issue's mandatory regression: it FAILS
-# before the fix (no codex branch → a stream-error codex reads identically to a
-# launch failure; a fan-out dropping BOTH agy and codex lists a reason only for
-# agy). Sources lib-review-agy.sh so the both-dropped case exercises both libs.
-AGY_LIB="$PROJECT_ROOT/skills/autonomous-dispatcher/scripts/lib-review-agy.sh"
-# shellcheck source=../../skills/autonomous-dispatcher/scripts/lib-review-agy.sh
-source "$AGY_LIB"
-
-# build_dropped_reasons <agent>:<verdict>:<logfixture> ...
-#   Mirrors the wrapper's per-agent loop body verbatim against the real libs:
-#   for an `unavailable` agy → agy classifier; for an `unavailable` codex →
-#   codex classifier. Echoes the assembled `_dropped_reasons` (trailing `; `
-#   trimmed).
-build_dropped_reasons() {
-  local spec agent verdict logf reasons="" tok
-  for spec in "$@"; do
-    agent="${spec%%:*}"; spec="${spec#*:}"
-    verdict="${spec%%:*}"; logf="${spec#*:}"
-    [[ "$verdict" == "unavailable" ]] || continue
-    if [[ "$agent" == "agy" ]]; then
-      tok=$(_classify_agy_drop_reason "$logf")
-      [[ -n "$tok" ]] && reasons+="${agent}: $(_agy_drop_reason_phrase "$tok"); "
-    elif [[ "$agent" == "codex" ]]; then
-      tok=$(_classify_codex_drop_reason "$logf")
-      [[ -n "$tok" ]] && reasons+="${agent}: $(_codex_drop_reason_phrase "$tok"); "
-    fi
-  done
-  printf '%s' "${reasons%; }"
-}
-
-# TC-CODEX-DROP-LOOP-01 — codex dropped on a stream-error log → reason names codex + stream-error
-loop01=$(build_dropped_reasons "codex:unavailable:$FIXTURES/codex-stream-error-turn.jsonl")
-assert_contains "TC-CODEX-DROP-LOOP-01 stream-error loop reason names codex + stream-error" \
-  "codex: stream-error" "$loop01"
-
-# TC-CODEX-DROP-LOOP-02 — codex dropped on a generic/no-signal log → empty reason
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$NARRATION_TURN"; } > "$DLOG"
-loop02=$(build_dropped_reasons "codex:unavailable:$DLOG")
-assert_eq "TC-CODEX-DROP-LOOP-02 generic codex drop → empty reason (bare unavailable)" "" "$loop02"
-
-# TC-CODEX-DROP-LOOP-03 — BOTH agy (quota) AND codex (stream-error) dropped in the
-# SAME fan-out → reasons list a DISTINCT clause for each (the AC #2 regression
-# guard on the assembly loop only handling agy).
-loop03=$(build_dropped_reasons \
-  "agy:unavailable:$FIXTURES/agy-quota-exhausted.fixture" \
-  "codex:unavailable:$FIXTURES/codex-stream-error-turn.jsonl")
-assert_contains "TC-CODEX-DROP-LOOP-03a both-dropped lists the agy quota reason" "agy: quota-exhausted" "$loop03"
-assert_contains "TC-CODEX-DROP-LOOP-03b both-dropped lists the codex stream-error reason" "codex: stream-error" "$loop03"
-
-# TC-CODEX-DROP-LOOP-04 — a non-codex/non-agy unavailable agent adds no reason
-loop04=$(build_dropped_reasons "kiro:unavailable:$FIXTURES/codex-stream-error-turn.jsonl")
-assert_eq "TC-CODEX-DROP-LOOP-04 non-agy/non-codex unavailable agent adds no reason" "" "$loop04"
-
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== TC-CODEX-DROP-SRC: wrapper wiring (source-of-truth) ==="
-# ---------------------------------------------------------------------------
-assert_grep "TC-CODEX-DROP-SRC-01 wrapper captures the per-agent codex log path (AGENT_CODEX_LOGS)" \
-  'AGENT_CODEX_LOGS' "$WRAPPER"
-assert_grep "TC-CODEX-DROP-SRC-02 wrapper calls _classify_codex_drop_reason" \
-  '_classify_codex_drop_reason' "$WRAPPER"
-assert_grep "TC-CODEX-DROP-SRC-03 dropped-agent reason assembly interpolates the codex reason phrase" \
-  '_codex_drop_reason_phrase' "$WRAPPER"
-# TC-CODEX-DROP-SRC-04 — bash -n parses both files
+# TC-CXRS-WIRE-06 — the stdout fallback posts via post-verdict + composes the body
+assert_grep "TC-CXRS-WIRE-06a wrapper composes the fallback body" \
+  '_codex_review_compose_body' "$WRAPPER"
+assert_grep "TC-CXRS-WIRE-06b wrapper classifies codex stdout" \
+  '_codex_review_classify_stdout' "$WRAPPER"
+assert_grep "TC-CXRS-WIRE-06c fallback posts via post-verdict.sh" \
+  'post-verdict.sh' "$WRAPPER"
+# TC-CXRS-WIRE-07 — both files parse
 if bash -n "$LIB" 2>/dev/null; then
-  echo -e "  ${GREEN}PASS${NC}: TC-CODEX-DROP-SRC-04a lib-review-codex.sh parses (bash -n)"; PASS=$((PASS + 1))
+  echo -e "  ${GREEN}PASS${NC}: TC-CXRS-WIRE-07a lib-review-codex.sh parses (bash -n)"; PASS=$((PASS + 1))
 else
-  echo -e "  ${RED}FAIL${NC}: TC-CODEX-DROP-SRC-04a lib-review-codex.sh fails bash -n"; FAIL=$((FAIL + 1))
+  echo -e "  ${RED}FAIL${NC}: TC-CXRS-WIRE-07a lib-review-codex.sh fails bash -n"; FAIL=$((FAIL + 1))
 fi
 if bash -n "$WRAPPER" 2>/dev/null; then
-  echo -e "  ${GREEN}PASS${NC}: TC-CODEX-DROP-SRC-04b autonomous-review.sh parses (bash -n)"; PASS=$((PASS + 1))
+  echo -e "  ${GREEN}PASS${NC}: TC-CXRS-WIRE-07b autonomous-review.sh parses (bash -n)"; PASS=$((PASS + 1))
 else
-  echo -e "  ${RED}FAIL${NC}: TC-CODEX-DROP-SRC-04b autonomous-review.sh fails bash -n"; FAIL=$((FAIL + 1))
+  echo -e "  ${RED}FAIL${NC}: TC-CXRS-WIRE-07b autonomous-review.sh fails bash -n"; FAIL=$((FAIL + 1))
 fi
+# TC-CXRS-WIRE-08 — CI shellcheck still lists the lib
+assert_grep "TC-CXRS-WIRE-08 CI shellcheck includes lib-review-codex.sh" \
+  'lib-review-codex.sh' "$CI"
+# TC-CXRS-WIRE-09 — drop-reason loop still wires the codex classifier
+assert_grep "TC-CXRS-WIRE-09 wrapper calls _classify_codex_drop_reason" \
+  '_classify_codex_drop_reason' "$WRAPPER"
+# TC-CXRS-WIRE-10 — #218 finding 2 source-of-truth: the REAL wrapper's stdout
+# fallback gates on a clean (rc 0) codex review exit. The INT-07..09 behavioral
+# tests exercise a COPY of the fallback block; these greps pin the gate in the
+# actual autonomous-review.sh so it can't silently regress (a non-zero exit must
+# never post a fabricated verdict). The gate reads the launch rc from
+# AGENT_LAUNCH_RC and admits ONLY rc 0 (a completed review).
+assert_grep "TC-CXRS-WIRE-10a wrapper reads the codex launch rc from AGENT_LAUNCH_RC (#218 finding 2)" \
+  '_cx_launch_rc="\$\{AGENT_LAUNCH_RC\[' "$WRAPPER"
+assert_grep "TC-CXRS-WIRE-10b wrapper stdout-fallback admits ONLY rc 0 (#218 finding 2)" \
+  '\[\[ "\$_cx_launch_rc" -eq 0 \]\]' "$WRAPPER"
+# TC-CXRS-WIRE-11 — the wrapper builds the codex review argv via the nameref
+# OUT-ARRAY (#218 finding 1: _run_codex_review must NOT serialize/parse the prompt
+# through newlines). Pin that _codex_review_argv is called with an out-array first
+# arg in the lib (the production caller).
+assert_grep "TC-CXRS-WIRE-11 _run_codex_review builds argv via the nameref out-array (#218 finding 1)" \
+  '_codex_review_argv _argv ' "$LIB"
+
+# ===========================================================================
+echo ""
+echo "=== TC-CXRS-INT: integration — stdout fallback verdict path (behavioral) ==="
+# ===========================================================================
+# Replicate the wrapper's INV-62 stdout-fallback block against the real lib + a
+# stub post-verdict.sh + a stub _fetch_agent_verdict_body / _classify_verdict_body,
+# proving: [P1] → FAIL composed + posted; clean → PASS posted; self-posted → no
+# double-post; stream-error capture → NOT fabricated into a verdict.
+
+# fallback_case <stdout-fixture> <already-resolved-verdict> <already-self-posted> [fb_lag] [launch_rc]
+#   Echoes "<posted?>|<verdict-arg>|<resolved-verdict>"
+#   - posted?        : "POST" if the stub post-verdict.sh was invoked, else "NOPOST"
+#   - verdict-arg    : the pass/fail arg passed to post-verdict.sh (or "-")
+#   - resolved       : the AGENT_VERDICTS value after the block
+#   - fb_lag         : when "lag", the stub _fetch_agent_verdict_body returns EMPTY
+#                      (simulates GitHub comments-API propagation lag: the verdict
+#                      comment WAS posted but is not yet visible to the re-fetch).
+#                      Exercises the M1 race — a successfully-posted verdict must
+#                      NOT be left unresolved (→ dropped `unavailable`) just because
+#                      the immediate re-fetch hasn't caught up.
+#   - launch_rc      : the codex member's _run_codex_review exit code (default 0).
+#                      A non-zero rc means codex review did NOT complete cleanly, so
+#                      the rc-0 gate (#218 finding 2) must SKIP the stdout fallback —
+#                      a CLI usage/auth error printing `error: …` with no `[P1]` must
+#                      NOT be posted as a false PASS.
+fallback_case() {
+  local fixture="$1" pre_verdict="$2" pre_body="$3" fb_lag="${4:-}" launch_rc="${5:-0}"
+  local sandbox; sandbox=$(mktemp -d)
+  local cap="$sandbox/cap.txt"
+  [[ -n "$fixture" ]] && cp "$fixture" "$cap" || : > "$cap"
+  : > "$sandbox/postlog"
+  (
+    set -uo pipefail
+    source "$LIB"
+    # Stubs for the poll helpers the wrapper block uses.
+    SCRIPT_DIR="$sandbox"
+    ISSUE_NUMBER=999
+    _fb_lag="$fb_lag"
+    _resolve_review_agent_model() { echo "sonnet"; }
+    _fetch_agent_verdict_body() {
+      # `lag` → API hasn't surfaced the just-posted comment yet → empty.
+      [[ "$_fb_lag" == "lag" ]] && { printf ''; return 0; }
+      cat "$sandbox/posted_body" 2>/dev/null || true
+    }
+    _classify_verdict_body() {
+      # FAIL-first, mirrors lib-review-poll.sh.
+      if grep -qiE '^[[:space:]]*Review findings:' <<<"${1%%$'\n'*}"; then echo fail; else echo pass; fi
+    }
+    log() { :; }
+    # Stub post-verdict.sh: record the verdict arg, write the composed comment so
+    # _fetch_agent_verdict_body returns it (canonical first line prepended).
+    cat > "$sandbox/post-verdict.sh" <<PV
+#!/bin/bash
+echo "POST \$2" >> "$sandbox/postlog"
+{ if [[ "\$2" == "fail" ]]; then echo "Review findings:"; else echo "Review PASSED"; fi
+  cat "\$3"
+  echo "Review Session: \\\`\$5\\\`"
+  echo "Review Agent: \$4 (model: \$6)"; } > "$sandbox/posted_body"
+exit 0
+PV
+    chmod +x "$sandbox/post-verdict.sh"
+
+    AGENT_NAMES=(codex)
+    AGENT_SESSION_IDS=(sid-codex)
+    AGENT_CODEX_LOGS=("$cap")
+    AGENT_VERDICTS=("$pre_verdict")
+    AGENT_VERDICT_BODIES=("$pre_body")
+    declare -A AGENT_LAUNCH_RC=([sid-codex]="$launch_rc")
+
+    # --- the wrapper's INV-62 fallback block, replicated verbatim ---
+    for _i in "${!AGENT_NAMES[@]}"; do
+      [[ "${AGENT_NAMES[$_i]}" == "codex" ]] || continue
+      [[ -n "${AGENT_VERDICTS[$_i]}" ]] && continue
+      [[ -n "${AGENT_VERDICT_BODIES[$_i]}" ]] && continue
+      # #218 findings 2 + 5: ONLY a clean rc-0 (completed) review is eligible for the
+      # stdout fallback. Any non-zero rc (124/137 cap, a usage/auth/config error, or
+      # a genuine stream failure which exits non-zero) is left UNRESOLVED for the
+      # terminal sweep — never fabricated into a verdict. The rc-0 gate is the SOLE
+      # gate: there is NO stream-error skip on the rc-0 path (a real stream failure is
+      # non-zero, already filtered; and `_codex_review_has_stream_error` is a broad
+      # substring scan that would false-positive on a clean review merely MENTIONING
+      # the phrase — #218 finding 5). So an rc-0 review (empty, clean, or text that
+      # mentions stream-error strings) always classifies + posts exactly one verdict.
+      [[ "${AGENT_LAUNCH_RC[${AGENT_SESSION_IDS[$_i]}]:-1}" -eq 0 ]] || continue
+      _cx_stdout="${AGENT_CODEX_LOGS[$_i]:-}"
+      _cx_verdict=$(_codex_review_classify_stdout "$_cx_stdout")
+      _cx_body_file=$(mktemp "$sandbox/body-XXXXXX.md")
+      _codex_review_compose_body "$_cx_verdict" "$_cx_stdout" > "$_cx_body_file" 2>/dev/null || true
+      _cx_fb_model=$(_resolve_review_agent_model "codex"); _cx_fb_model="${_cx_fb_model:-sonnet}"
+      if bash "${SCRIPT_DIR}/post-verdict.sh" "$ISSUE_NUMBER" "$_cx_verdict" "$_cx_body_file" \
+           codex "${AGENT_SESSION_IDS[$_i]}" "$_cx_fb_model" >/dev/null 2>&1; then
+        _cx_refetched=$(_fetch_agent_verdict_body "codex" "${AGENT_SESSION_IDS[$_i]}")
+        if [[ -n "$_cx_refetched" ]]; then
+          AGENT_VERDICT_BODIES[$_i]="$_cx_refetched"
+          AGENT_VERDICTS[$_i]=$(_classify_verdict_body "$_cx_refetched")
+        else
+          AGENT_VERDICT_BODIES[$_i]=$(cat "$_cx_body_file" 2>/dev/null || true)
+          AGENT_VERDICTS[$_i]="$_cx_verdict"
+        fi
+      fi
+      rm -f "$_cx_body_file" 2>/dev/null || true
+    done
+
+    posted="NOPOST"; verdict_arg="-"
+    if [[ -s "$sandbox/postlog" ]]; then posted="POST"; verdict_arg=$(awk '{print $2}' "$sandbox/postlog" | head -n1); fi
+    echo "${posted}|${verdict_arg}|${AGENT_VERDICTS[0]}"
+  )
+  rm -rf "$sandbox"
+}
+
+# TC-CXRS-INT-01 — [P1] stdout, not self-posted → wrapper posts FAIL, resolves fail
+assert_eq "TC-CXRS-INT-01 [P1] not self-posted → wrapper posts FAIL → resolves fail" \
+  "POST|fail|fail" "$(fallback_case "$FIXTURES/codex-review-stdout-p1.txt" "" "")"
+
+# TC-CXRS-INT-02 — clean stdout, not self-posted → wrapper posts PASS, resolves pass
+assert_eq "TC-CXRS-INT-02 clean not self-posted → wrapper posts PASS → resolves pass" \
+  "POST|pass|pass" "$(fallback_case "$FIXTURES/codex-review-stdout-clean.txt" "" "")"
+
+# TC-CXRS-INT-03 — codex self-posted (pre_body set) → NO double-post
+assert_eq "TC-CXRS-INT-03 codex self-posted → wrapper does NOT double-post" \
+  "NOPOST|-|pass" "$(fallback_case "$FIXTURES/codex-review-stdout-clean.txt" "pass" "Review PASSED ...")"
+
+# TC-CXRS-INT-04 — a GENUINE pure stream failure exits NON-ZERO (the CLI exhausts
+# its SSE reconnects and `turn.failed`s). With a non-zero launch rc it is dropped by
+# the rc-0 gate (→ unresolved → `unavailable` via the sweep + the stream-error
+# drop-reason path) — NOT fabricated into a verdict. (#218 finding 5: the realistic
+# stream-error case is non-zero rc; the old test used rc 0, which conflated a real
+# failure with an rc-0 review that merely MENTIONS the phrase — see INT-04b.)
+assert_eq "TC-CXRS-INT-04 genuine stream failure (non-zero rc) → dropped by the rc-0 gate (unresolved)" \
+  "NOPOST|-|" "$(fallback_case "$FIXTURES/codex-review-stdout-stream-error.txt" "" "" "" 1)"
+
+# TC-CXRS-INT-04b — #218 finding 5 REGRESSION: an rc-0 COMPLETED review whose capture
+# MENTIONS the stream-error phrases (e.g. a clean review of THIS PR's stream-error
+# fixtures / the detector) but has no `[P1]` MUST still post the default PASS — NOT
+# be dropped by a broad-substring stream-error skip. The fix removed the stream-error
+# skip from the rc-0 path; the rc-0 gate is the sole gate. The stream-error fixture
+# at rc 0 (a review that talks ABOUT a stream error, not one that suffered it) →
+# classifies PASS (no `[P1]`) and posts. Proven to fail against the pre-fix skip
+# (which would `continue` → NOPOST → dropped `unavailable`).
+assert_eq "TC-CXRS-INT-04b rc-0 review MENTIONING stream-error phrase (no [P1]) → posts PASS (finding 5)" \
+  "POST|pass|pass" "$(fallback_case "$FIXTURES/codex-review-stdout-stream-error.txt" "" "" "" 0)"
+
+# TC-CXRS-INT-05 — re-fetch LAGS (comments API hasn't surfaced the just-posted
+# verdict yet) on a clean PASS → the agent MUST still resolve `pass` from the
+# wrapper's own composed body, NOT be left unresolved (→ spuriously dropped
+# `unavailable` by the post-window sweep). Guards the M1 propagation race: the
+# wrapper KNOWS the verdict it composed + posted; classifying the posted comment
+# is identical (post-verdict.sh prepends `Review PASSED`/`Review findings:`), so a
+# lagging API read must never demote a successfully-posted verdict to no-verdict.
+assert_eq "TC-CXRS-INT-05 PASS with lagging re-fetch → still resolves pass (not dropped unavailable)" \
+  "POST|pass|pass" "$(fallback_case "$FIXTURES/codex-review-stdout-clean.txt" "" "" lag)"
+
+# TC-CXRS-INT-06 — re-fetch LAGS on a [P1] FAIL → still resolves `fail` from the
+# wrapper's own composed body (a passing-merge veto must survive the lag too).
+assert_eq "TC-CXRS-INT-06 FAIL with lagging re-fetch → still resolves fail (not dropped unavailable)" \
+  "POST|fail|fail" "$(fallback_case "$FIXTURES/codex-review-stdout-p1.txt" "" "" lag)"
+
+# TC-CXRS-INT-07 — #218 FINDING 2 REGRESSION: a codex review that exited NON-ZERO
+# (a CLI usage/auth/config error — here a broken invocation printing `error: …` to
+# the capture with NO `[P1]`) must NOT be classified PASS and posted by the wrapper.
+# The pre-fix fallback gated only on 124/137, so this `error:` capture (rc 1) would
+# read as PASS (no `[P1]`) → a FALSE PASS for a review that never ran. The rc-0 gate
+# leaves it UNRESOLVED for the terminal sweep (→ `unavailable`). NOPOST + empty
+# resolution. This is the dangerous interaction with finding 1 the reviewer flagged.
+assert_eq "TC-CXRS-INT-07 non-zero exit (CLI error, no [P1]) → NOT posted as false PASS (rc-0 gate)" \
+  "NOPOST|-|" "$(fallback_case "$FIXTURES/codex-review-stdout-cli-error.txt" "" "" "" 1)"
+
+# TC-CXRS-INT-08 — a non-zero exit even with a [P1] in the capture is still left
+# unresolved: a non-completed review is not a trustworthy verdict source regardless
+# of what partial text it streamed. (rc 1, stdout has [P1] → still NOPOST.)
+assert_eq "TC-CXRS-INT-08 non-zero exit with [P1] in partial stdout → still unresolved (rc-0 gate)" \
+  "NOPOST|-|" "$(fallback_case "$FIXTURES/codex-review-stdout-p1.txt" "" "" "" 1)"
+
+# TC-CXRS-INT-09 — the rc-0 happy path is unaffected: an explicit rc 0 with a clean
+# review still posts PASS (the gate admits a completed review).
+assert_eq "TC-CXRS-INT-09 rc 0 clean review → posts PASS (gate admits completed review)" \
+  "POST|pass|pass" "$(fallback_case "$FIXTURES/codex-review-stdout-clean.txt" "" "" "" 0)"
+
+# TC-CXRS-INT-10 — #218 review finding 2: an rc-0 review that did NOT self-post and
+# produced an EMPTY capture (the diff had nothing blocking; codex emitted little/no
+# text) must STILL post the default PASS — NOT be dropped `unavailable`. An empty
+# fixture ("") makes fallback_case write an empty capture (`: > "$cap"`). The pre-fix
+# `[[ -n && -s ]] || continue` guard dropped it; the fix posts the composed default
+# PASS, upholding INV-62's "exactly one verdict". POST|pass|pass.
+assert_eq "TC-CXRS-INT-10 rc 0, empty capture, no self-post → posts default PASS (not dropped unavailable)" \
+  "POST|pass|pass" "$(fallback_case "" "" "" "" 0)"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== TC-CODEX-DROP-REG: regression ==="
+echo "=== TC-CXRS-MLP: _run_codex_review passes a MULTI-LINE prompt as ONE arg (#218 finding 1) ==="
 # ---------------------------------------------------------------------------
-# TC-CODEX-DROP-REG-01 — a stream-error codex drop classifies DISTINCTLY from a
-# generic/no-verdict drop (the core regression: pre-fix both produce no reason).
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$STREAM_ERROR_TURN"; } > "$DLOG"
-reg_stream=$(_classify_codex_drop_reason "$DLOG")
-{ echo '{"type":"thread.started","thread_id":"aaaa"}'; echo "$NARRATION_TURN"; } > "$DLOG"
-reg_generic=$(_classify_codex_drop_reason "$DLOG")
-if [[ "$reg_stream" != "$reg_generic" && -n "$reg_stream" ]]; then
-  echo -e "  ${GREEN}PASS${NC}: TC-CODEX-DROP-REG-01 stream-error drop classified distinctly from a no-verdict drop"; PASS=$((PASS + 1))
-else
-  echo -e "  ${RED}FAIL${NC}: TC-CODEX-DROP-REG-01 not distinguished (stream='$reg_stream' generic='$reg_generic')"; FAIL=$((FAIL + 1))
-fi
-
-# TC-CODEX-DROP-REG-02 — a clean no-verdict turn (#198) is NOT misreported as a
-# stream error (no over-claim).
-assert_eq "TC-CODEX-DROP-REG-02 clean no-verdict turn not misreported as stream-error" \
-  "" "$reg_generic"
-
-# ===========================================================================
-# Issue #212: codex resume honors the per-agent AGENT_REVIEW_EXTRA_ARGS override
-# ===========================================================================
-# `run_agent` (turn 1) reads AGENT_DEV_EXTRA_ARGS; `resume_agent` (subsequent
-# turns) reads AGENT_REVIEW_EXTRA_ARGS — two DIFFERENT vars. The codex review
-# lane is the one CLI that RESUMES (gather-only turn 1 → resume_agent). Before
-# the fix the fan-out subshell aliased the resolved per-agent extra-args onto
-# ONLY AGENT_DEV_EXTRA_ARGS, so codex's `exec resume` read the SHARED
-# AGENT_REVIEW_EXTRA_ARGS and dropped the per-agent _CODEX override — a shared
-# `--trust-all-tools` (set for kiro) crashed `codex exec resume` with exit 2 and
-# codex was dropped `unavailable` on every review. The fix aliases the resolved
-# value onto BOTH vars inside the subshell.
-#
-# Strategy: drive the REAL resume_agent codex branch (lib-agent.sh) with a
-# stubbed `codex` on PATH that records argv, a pre-seeded thread-id sidecar so
-# resume_agent resumes (instead of falling back to a fresh run), and the
-# wrapper's per-agent subshell logic (resolve via lib-review-resolve.sh, assign
-# both vars) replicated faithfully. We assert the codex `exec resume` argv.
-echo ""
-echo "=== TC-CXR-XA: codex resume honors per-agent review extra-args (#212) ==="
-RESOLVE_LIB="$PROJECT_ROOT/skills/autonomous-dispatcher/scripts/lib-review-resolve.sh"
-AGENT_LIB="$PROJECT_ROOT/skills/autonomous-dispatcher/scripts/lib-agent.sh"
-
-# Build a sandbox once: a stub `codex` (records argv), a stub `timeout`/`env`,
-# a PID dir for the codex thread sidecar.
-XA_ROOT=$(mktemp -d)
-trap 'rm -f "$TMPLOG" "$REC_RESUME_ARGV" "$REC_RESUME_CALLS" "$DLOG"; rm -rf "$XA_ROOT"' EXIT
-XA_BIN="$XA_ROOT/bin"; mkdir -p "$XA_BIN"
-XA_PID="$XA_ROOT/pid"; mkdir -p "$XA_PID"; chmod 700 "$XA_PID"
-
-# `codex` stub: record argv, then act as _codex_capture_thread's upstream by
-# emitting one thread.started line so the capture filter is happy (its output is
-# discarded by the test). The recorder file is given via CODEX_ARGV_FILE.
-cat > "$XA_BIN/codex" <<'EOF'
-#!/bin/bash
-printf '%s\n' "$*" > "${CODEX_ARGV_FILE}"
-echo '{"type":"thread.started","thread_id":"deadbeefdeadbeef"}'
-EOF
-chmod +x "$XA_BIN/codex"
-# `timeout` stub: drop its 3 leading args, exec the rest.
-cat > "$XA_BIN/timeout" <<'EOF'
-#!/bin/bash
-shift 3
-exec "$@"
-EOF
-chmod +x "$XA_BIN/timeout"
-
-XA_SID="abc12345-1111-2222-3333-444444444444"
-XA_ARGV="$XA_ROOT/codex-argv"
-
-# run_codex_resume_argv <shared_extra> <per_agent_codex_extra>
-#   Replicate the wrapper's per-agent codex subshell: source the resolver,
-#   resolve the per-agent extra-args, assign BOTH AGENT_DEV_EXTRA_ARGS and
-#   AGENT_REVIEW_EXTRA_ARGS (the fix), seed the thread sidecar so resume fires,
-#   then call resume_agent. Echo the recorded `codex exec resume` argv.
-run_codex_resume_argv() {
-  local shared="$1" per_codex="$2"
-  : > "$XA_ARGV"
-  PATH="$XA_BIN:$PATH" \
-  AUTONOMOUS_PID_DIR="$XA_PID" \
-  PROJECT_ID="testproj" \
-  PROJECT_DIR="$XA_ROOT" \
-  AGENT_PERMISSION_MODE=auto \
-  CODEX_ARGV_FILE="$XA_ARGV" \
-  AGENT_REVIEW_EXTRA_ARGS="$shared" \
-  AGENT_REVIEW_EXTRA_ARGS_CODEX="$per_codex" \
-  bash -c '
-    source "'"$RESOLVE_LIB"'"
-    source "'"$AGENT_LIB"'"
-    # Seed the codex thread-id sidecar so resume_agent resumes (not fresh).
-    tf=$(AGENT_CMD=codex _codex_thread_file "'"$XA_SID"'")
-    printf "%s\n" "deadbeefdeadbeef" > "$tf"
-    # --- the wrapper per-agent subshell, replicated for codex ---
-    (
-      AGENT_CMD=codex
-      _resolved=$(_resolve_review_agent_extra_args codex)
-      AGENT_DEV_EXTRA_ARGS="$_resolved"
-      AGENT_REVIEW_EXTRA_ARGS="$_resolved"
-      resume_agent "'"$XA_SID"'" "verdict prompt" "model-x" "sess"
-    )
-  ' >/dev/null 2>&1
-  cat "$XA_ARGV"
-}
-
-# TC-CXR-XA-01 — per-agent _CODEX value present, shared value absent.
-xa01=$(run_codex_resume_argv "--trust-all-tools" "-s danger-full-access")
-assert_contains "TC-CXR-XA-01a codex resume argv carries the per-agent -s danger-full-access" \
-  "-s danger-full-access" "$xa01"
-assert_not_contains "TC-CXR-XA-01b codex resume argv does NOT carry the shared --trust-all-tools" \
-  "--trust-all-tools" "$xa01"
-assert_contains "TC-CXR-XA-01c codex resume argv keeps structural 'exec resume'" \
-  "exec resume" "$xa01"
-
-# TC-CXR-XA-02 — shared only (no per-agent key): the shared value reaches resume.
-xa02=$(run_codex_resume_argv "--shared-flag" "")
-assert_contains "TC-CXR-XA-02 shared-only: codex resume argv carries --shared-flag (no regression)" \
-  "--shared-flag" "$xa02"
-
-# TC-CXR-XA-03 — the #212 regression, exercising the REAL resume_agent codex
-# branch (not a replica). This pins the ROOT CAUSE: resume_agent reads
-# AGENT_REVIEW_EXTRA_ARGS, NOT AGENT_DEV_EXTRA_ARGS. The pre-fix wrapper aliased
-# the resolved per-agent value onto ONLY AGENT_DEV_EXTRA_ARGS — so we drive
-# resume_agent with the resolved value on AGENT_DEV only (pre-fix shape) and
-# show the per-agent `-s danger-full-access` does NOT reach codex resume, while
-# the shared `--trust-all-tools` (set on AGENT_REVIEW) DOES → exactly the exit-2
-# drop. Then with the fix's dual assignment the per-agent value reaches resume.
-# If anyone reverts resume_agent to read AGENT_DEV_EXTRA_ARGS, the dual-assign
-# would be unnecessary — but that is a SEPARATE lib change deliberately out of
-# scope; this test documents the contract the wrapper fix depends on.
-run_codex_resume_argv_devonly() {
-  # Replicate the PRE-FIX wrapper subshell: resolved value on AGENT_DEV only.
-  local shared="$1" per_codex="$2"
-  : > "$XA_ARGV"
-  PATH="$XA_BIN:$PATH" \
-  AUTONOMOUS_PID_DIR="$XA_PID" \
-  PROJECT_ID="testproj" \
-  PROJECT_DIR="$XA_ROOT" \
-  AGENT_PERMISSION_MODE=auto \
-  CODEX_ARGV_FILE="$XA_ARGV" \
-  AGENT_REVIEW_EXTRA_ARGS="$shared" \
-  AGENT_REVIEW_EXTRA_ARGS_CODEX="$per_codex" \
-  bash -c '
-    source "'"$RESOLVE_LIB"'"
-    source "'"$AGENT_LIB"'"
-    tf=$(AGENT_CMD=codex _codex_thread_file "'"$XA_SID"'")
-    printf "%s\n" "deadbeefdeadbeef" > "$tf"
-    (
-      AGENT_CMD=codex
-      _resolved=$(_resolve_review_agent_extra_args codex)
-      AGENT_DEV_EXTRA_ARGS="$_resolved"   # PRE-FIX: only the dev var
-      resume_agent "'"$XA_SID"'" "verdict prompt" "model-x" "sess"
-    )
-  ' >/dev/null 2>&1
-  cat "$XA_ARGV"
-}
-xa03_prefix=$(run_codex_resume_argv_devonly "--trust-all-tools" "-s danger-full-access")
-assert_not_contains "TC-CXR-XA-03a pre-fix shape: per-agent -s danger-full-access does NOT reach codex resume (root cause)" \
-  "-s danger-full-access" "$xa03_prefix"
-assert_contains "TC-CXR-XA-03b pre-fix shape: codex resume instead carries the rejected shared --trust-all-tools (→ exit 2 drop)" \
-  "--trust-all-tools" "$xa03_prefix"
-xa03_fixed=$(run_codex_resume_argv "--trust-all-tools" "-s danger-full-access")
-assert_not_contains "TC-CXR-XA-03c with the dual-var fix: codex resume no longer inherits the rejected shared --trust-all-tools" \
-  "--trust-all-tools" "$xa03_fixed"
-
-# TC-CXR-XA-ISO-01 — sibling isolation. The fix writes AGENT_REVIEW_EXTRA_ARGS,
-# a var the PARENT fan-out loop also reads. Assert a codex subshell's assignment
-# does NOT leak back into the parent, and a sibling (kiro) subshell resolves only
-# its own value. Pure-resolver level (no CLI launch needed).
-iso01=$(
+# End-to-end argv guard: drive _run_codex_review with a stub _run_with_timeout that
+# records its argv (NUL-delimited) and assert the multi-line prompt arrives as a
+# SINGLE positional argument — not split at newlines into many positionals (which
+# would make `codex review` fail before reviewing).
+mlp_argv=$(
   set -uo pipefail
-  source "$RESOLVE_LIB"
-  AGENT_REVIEW_EXTRA_ARGS="--shared-flag"
-  AGENT_REVIEW_EXTRA_ARGS_CODEX="-s danger-full-access"
-  unset AGENT_REVIEW_EXTRA_ARGS_KIRO 2>/dev/null || true
-  parent_before="$AGENT_REVIEW_EXTRA_ARGS"
-  # codex fan-out subshell mutates AGENT_REVIEW_EXTRA_ARGS (the fix).
-  ( AGENT_CMD=codex
-    _r=$(_resolve_review_agent_extra_args codex)
-    AGENT_DEV_EXTRA_ARGS="$_r"; AGENT_REVIEW_EXTRA_ARGS="$_r"
-    : )
-  parent_after="$AGENT_REVIEW_EXTRA_ARGS"
-  # sibling kiro subshell resolves only its own value (falls back to shared).
-  kiro_seen=$( AGENT_CMD=kiro
-    _r=$(_resolve_review_agent_extra_args kiro)
-    AGENT_DEV_EXTRA_ARGS="$_r"; AGENT_REVIEW_EXTRA_ARGS="$_r"
-    printf '%s' "$AGENT_REVIEW_EXTRA_ARGS" )
-  echo "before=[$parent_before] after=[$parent_after] kiro=[$kiro_seen]"
+  source "$LIB"
+  sandbox=$(mktemp -d)
+  # Record argv NUL-delimited so a multi-line element is preserved intact.
+  _run_with_timeout() { shift; printf '%s\0' "$@" > "$sandbox/argv.nul"; echo "review output"; return 0; }
+  _codex_now_seconds() { printf '%s\n' 0; }
+  prompt=$'You are reviewing PR #219.\n\n## Decision\nPost via post-verdict.sh.'
+  CODEX_REVIEW_MAX_RERUNS=3 AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review "$prompt" "sonnet" "$sandbox/cap.txt" >/dev/null 2>&1
+  # element count + the prompt element verbatim
+  cnt=$(tr -cd '\0' < "$sandbox/argv.nul" | wc -c | tr -d ' ')
+  # The prompt is argv element index 1 (after `review`); extract it (2nd NUL field).
+  prompt_arg=$(awk 'BEGIN{RS="\0"} NR==2{print; exit}' "$sandbox/argv.nul")
+  first_arg=$(awk 'BEGIN{RS="\0"} NR==1{print; exit}' "$sandbox/argv.nul")
+  printf 'cnt=%s|first=%s|match=%s' "$cnt" "$first_arg" "$([[ "$prompt_arg" == "$prompt" ]] && echo yes || echo no)"
+  rm -rf "$sandbox"
 )
-assert_contains "TC-CXR-XA-ISO-01a parent AGENT_REVIEW_EXTRA_ARGS unchanged after codex subshell" \
-  "before=[--shared-flag] after=[--shared-flag]" "$iso01"
-assert_contains "TC-CXR-XA-ISO-01b sibling kiro subshell sees only its own (shared fallback) value, not codex's _CODEX override" \
-  "kiro=[--shared-flag]" "$iso01"
+# review + prompt + -c + model = 4 elements; first arg is `review`; the multi-line
+# prompt element matches verbatim (NOT split into multiple positionals).
+assert_eq "TC-CXRS-MLP-01 multi-line prompt reaches codex review as ONE arg" \
+  "cnt=4|first=review|match=yes" "$mlp_argv"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== TC-CXR-XA-SRC: wrapper aliases resolved extra-args onto BOTH vars (#212) ==="
+echo "=== TC-CXRS-WT: PR-branch worktree for codex review (#218 finding 3) ==="
 # ---------------------------------------------------------------------------
-# Source-of-truth: the per-agent subshell must assign the resolved review
-# extra-args to AGENT_REVIEW_EXTRA_ARGS (read by resume_agent) in ADDITION to
-# AGENT_DEV_EXTRA_ARGS (read by run_agent). The TC-PAM-SRC-05 grep in
-# test-autonomous-review-per-agent-model.sh covers the AGENT_DEV alias; this
-# pins the AGENT_REVIEW alias here too.
-assert_grep "TC-CXR-XA-SRC-01 wrapper assigns AGENT_REVIEW_EXTRA_ARGS the resolved per-agent value (resume_agent's var)" \
-  'AGENT_REVIEW_EXTRA_ARGS="\$_resolved_review_extra_args"' "$WRAPPER"
-# The misleading "the review wrapper never resumes" claim must be gone (codex does).
-if grep -qE 'review wrapper never resumes' "$WRAPPER"; then
-  echo -e "  ${RED}FAIL${NC}: TC-CXR-XA-SRC-02 stale 'review wrapper never resumes' claim still present in wrapper comment"
+# `codex review` auto-scopes its diff against the CURRENT checkout, so the wrapper
+# must run it from a PR-branch worktree (not PROJECT_DIR, which is on `main`).
+# Build a throwaway git repo with a `main` and a `pr-branch` that diverges, then
+# exercise _codex_review_prepare_worktree / _codex_review_cleanup_worktree and the
+# _run_codex_review cwd behavior against it.
+
+# Build the fixture repo once.
+WT_REPO=$(mktemp -d)
+(
+  cd "$WT_REPO"
+  git init -q -b main
+  git config user.email t@t; git config user.name t
+  echo base > f.txt; git add f.txt; git commit -qm base
+  git checkout -q -b pr-branch
+  echo pr-change >> f.txt; git add f.txt; git commit -qm pr-change
+  git checkout -q main
+) >/dev/null 2>&1
+
+# TC-CXRS-WT-01 — prepare returns rc 0 and the dest is a checkout AT the PR-branch
+# tip (the pr-change commit), proving codex review there would diff the PR.
+wt01=$(
+  set -uo pipefail
+  source "$LIB"
+  cd "$WT_REPO"
+  dest="$WT_REPO/wt-01"
+  _codex_review_prepare_worktree "pr-branch" "$dest"; rc=$?
+  # HEAD of the worktree must be the pr-branch tip commit (the one that added pr-change).
+  head_subj=$(git -C "$dest" log -1 --format=%s 2>/dev/null || echo NONE)
+  has_change=$(grep -qF pr-change "$dest/f.txt" 2>/dev/null && echo yes || echo no)
+  _codex_review_cleanup_worktree "$dest"
+  exists_after=$([[ -d "$dest" ]] && echo yes || echo no)
+  echo "rc=${rc}|subj=${head_subj}|change=${has_change}|after=${exists_after}"
+)
+assert_eq "TC-CXRS-WT-01 prepare checks out the PR-branch tip; cleanup removes it" \
+  "rc=0|subj=pr-change|change=yes|after=no" "$wt01"
+
+# TC-CXRS-WT-02 — prepare fails (rc 1) on an empty branch arg / empty dest / not a repo.
+wt02=$(
+  set -uo pipefail
+  source "$LIB"
+  cd "$WT_REPO"
+  _codex_review_prepare_worktree "" "$WT_REPO/x";    a=$?
+  _codex_review_prepare_worktree "pr-branch" "";     b=$?
+  nonrepo=$(mktemp -d)
+  ( cd "$nonrepo"; source "$LIB"; _codex_review_prepare_worktree "pr-branch" "$nonrepo/y" ); c=$?
+  rm -rf "$nonrepo"
+  echo "${a}|${b}|${c}"
+)
+assert_eq "TC-CXRS-WT-02 prepare fails rc1 on empty-branch / empty-dest / non-repo" "1|1|1" "$wt02"
+
+# TC-CXRS-WT-03 — prepare fails (rc 1) for a non-existent branch (no ref resolves).
+wt03=$(
+  set -uo pipefail
+  source "$LIB"
+  cd "$WT_REPO"
+  _codex_review_prepare_worktree "no-such-branch" "$WT_REPO/wt-03"; echo "rc=$?"
+)
+assert_eq "TC-CXRS-WT-03 prepare fails rc1 for a non-existent branch" "rc=1" "$wt03"
+
+# --- #218 finding (stale-ref hazard): a clone with a REAL origin -------------
+# `git fetch origin <branch>` updates FETCH_HEAD reliably, but it updates the
+# remote-tracking ref `origin/<branch>` only when a fetch REFSPEC maps it. With the
+# refspec absent (a config the dispatcher box / certain CI checkouts can present),
+# `origin/<branch>` stays STALE while FETCH_HEAD is the fresh tip. The pre-fix
+# resolver preferred `origin/<branch>` over FETCH_HEAD, so it would check out the
+# STALE commit and let `codex review` vote on the wrong diff. Build a bare remote +
+# a clone, ADVANCE the remote, and REMOVE the fetch refspec so `origin/pr-branch`
+# cannot self-update on fetch — exactly the stale condition.
+WT_BARE=$(mktemp -d); WT_CLONE=$(mktemp -d)
+(
+  src=$(mktemp -d)
+  cd "$src"; git init -q -b main; git config user.email t@t; git config user.name t
+  echo base > f.txt; git add f.txt; git commit -qm base
+  git checkout -q -b pr-branch; echo v1 >> f.txt; git add f.txt; git commit -qm pr-v1
+  git checkout -q main
+  git clone -q --bare "$src" "$WT_BARE" >/dev/null 2>&1
+  # Clone the bare remote → origin/pr-branch == pr-v1.
+  git clone -q "$WT_BARE" "$WT_CLONE" >/dev/null 2>&1
+  ( cd "$WT_CLONE" && git fetch -q origin pr-branch:refs/remotes/origin/pr-branch 2>/dev/null || true )
+  # ADVANCE the remote's pr-branch to pr-v2.
+  cd "$src"; git checkout -q pr-branch; echo v2 >> f.txt; git add f.txt; git commit -qm pr-v2
+  git push -q "$WT_BARE" pr-branch >/dev/null 2>&1
+  # REMOVE the fetch refspec so a subsequent `git fetch origin pr-branch` updates
+  # FETCH_HEAD but leaves origin/pr-branch STALE at pr-v1.
+  ( cd "$WT_CLONE" && git config --unset-all remote.origin.fetch 2>/dev/null || true )
+  rm -rf "$src"
+) >/dev/null 2>&1
+# Fresh tip = "pr-v2"; the now-unupdatable origin/pr-branch stays "pr-v1".
+
+# TC-CXRS-WT-03b — STALE-REF REGRESSION: with origin/pr-branch pinned stale at pr-v1
+# (no refspec) and the remote advanced to pr-v2, prepare MUST check out the FRESH
+# tip (pr-v2, via FETCH_HEAD), NOT the stale origin/pr-branch (pr-v1). Pre-fix this
+# checked out pr-v1 (it preferred origin/pr-branch) → a vote on the wrong diff.
+wt03b=$(
+  set -uo pipefail
+  source "$LIB"
+  cd "$WT_CLONE"
+  stale_subj=$(git log -1 --format=%s origin/pr-branch 2>/dev/null || echo NONE)
+  dest="$WT_CLONE/wt-03b"
+  _codex_review_prepare_worktree "pr-branch" "$dest"; rc=$?
+  checked_subj=$(git -C "$dest" log -1 --format=%s 2>/dev/null || echo NONE)
+  # Confirm origin/pr-branch STAYED stale at pr-v1 (the fetch did not self-update it).
+  after_subj=$(git log -1 --format=%s origin/pr-branch 2>/dev/null || echo NONE)
+  _codex_review_cleanup_worktree "$dest"
+  echo "rc=${rc}|stale=${stale_subj}|after=${after_subj}|checked=${checked_subj}"
+)
+assert_eq "TC-CXRS-WT-03b prepare checks out the FRESH tip (pr-v2 via FETCH_HEAD), not the stale origin/pr-branch (pr-v1)" \
+  "rc=0|stale=pr-v1|after=pr-v1|checked=pr-v2" "$wt03b"
+
+# TC-CXRS-WT-03c — a FETCH FAILURE with a real origin is a HARD prepare failure
+# (rc 1), NOT a fall-through to a possibly-stale local/FETCH_HEAD ref. Simulate by
+# pointing origin at a non-existent path so the fetch cannot succeed; even though
+# the clone has a (stale) origin/pr-branch + a local FETCH_HEAD, prepare must FAIL.
+wt03c=$(
+  set -uo pipefail
+  source "$LIB"
+  cd "$WT_CLONE"
+  git remote set-url origin /nonexistent/bare-$$.git 2>/dev/null
+  _codex_review_prepare_worktree "pr-branch" "$WT_CLONE/wt-03c"; echo "rc=$?"
+)
+assert_eq "TC-CXRS-WT-03c origin present but fetch FAILS → hard prepare failure rc1 (no stale fall-through)" \
+  "rc=1" "$wt03c"
+rm -rf "$WT_BARE" "$WT_CLONE"
+
+# TC-CXRS-WT-04 — cleanup is rc-0-always (no crash) on a missing / empty dest.
+wt04=$(
+  set -euo pipefail
+  source "$LIB"
+  cd "$WT_REPO"
+  _codex_review_cleanup_worktree "/nonexistent/$$"; a=$?
+  _codex_review_cleanup_worktree ""; b=$?
+  echo "${a}|${b}"
+)
+assert_eq "TC-CXRS-WT-04 cleanup rc-0-always on missing/empty dest (no errexit abort)" "0|0" "$wt04"
+
+# TC-CXRS-WT-05 — _run_codex_review runs `codex review` FROM the passed PR-workdir
+# (the stub records its cwd, physical path); the wrapper's own cwd is unchanged
+# afterward (the cd is in a subshell).
+wt05=$(
+  set -uo pipefail
+  source "$LIB"
+  cd "$WT_REPO"
+  dest="$WT_REPO/wt-05"; _codex_review_prepare_worktree "pr-branch" "$dest" >/dev/null 2>&1
+  dest_p=$(cd "$dest" && pwd -P)
+  caller_before=$(pwd -P)
+  # Stub records the PHYSICAL cwd `codex review` ran in.
+  _run_with_timeout() { pwd -P > "$WT_REPO/ran_cwd.txt"; echo "review output"; return 0; }
+  _codex_now_seconds() { printf '%s\n' 0; }
+  CODEX_REVIEW_MAX_RERUNS=0 AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review "p" "sonnet" "$WT_REPO/cap.txt" "$dest" >/dev/null 2>&1
+  ran_cwd=$(cat "$WT_REPO/ran_cwd.txt" 2>/dev/null)
+  caller_after=$(pwd -P)
+  _codex_review_cleanup_worktree "$dest"
+  ran_in_wt=no; [[ "$ran_cwd" == "$dest_p" ]] && ran_in_wt=yes
+  cwd_stable=no; [[ "$caller_before" == "$caller_after" ]] && cwd_stable=yes
+  echo "ran_in_wt=${ran_in_wt}|cwd_stable=${cwd_stable}"
+)
+assert_eq "TC-CXRS-WT-05 codex review runs FROM the PR-branch worktree; wrapper cwd stable" \
+  "ran_in_wt=yes|cwd_stable=yes" "$wt05"
+
+# TC-CXRS-WT-06 — with NO pr_workdir, _run_codex_review warns + runs from cwd
+# (degraded path, never crashes). The stub records cwd == the caller's cwd.
+wt06=$(
+  set -uo pipefail
+  source "$LIB"
+  cd "$WT_REPO"
+  _run_with_timeout() { pwd > "$WT_REPO/ran_cwd6.txt"; echo "review output"; return 0; }
+  _codex_now_seconds() { printf '%s\n' 0; }
+  CODEX_REVIEW_MAX_RERUNS=0 AGENT_REVIEW_TIMEOUT=1h AGENT_CMD=codex \
+    _run_codex_review "p" "sonnet" "$WT_REPO/cap6.txt" "" 2> "$WT_REPO/warn6.txt" >/dev/null
+  ran_cwd=$(cat "$WT_REPO/ran_cwd6.txt" 2>/dev/null)
+  warned=$(grep -qi 'no PR-branch worktree' "$WT_REPO/warn6.txt" && echo yes || echo no)
+  echo "ran_in_cwd=$([[ "$(cd "$ran_cwd" && pwd -P)" == "$(cd "$WT_REPO" && pwd -P)" ]] && echo yes || echo no)|warned=${warned}"
+)
+assert_eq "TC-CXRS-WT-06 empty pr_workdir → runs from cwd + warns (degraded, no crash)" \
+  "ran_in_cwd=yes|warned=yes" "$wt06"
+
+rm -rf "$WT_REPO"
+
+# TC-CXRS-WT-SRC — wrapper source-of-truth: the codex branch prepares a PR-branch
+# worktree, passes it to _run_codex_review, and cleans it up.
+assert_grep "TC-CXRS-WT-SRC-01 wrapper prepares a PR-branch worktree for codex review" \
+  '_codex_review_prepare_worktree "\$PR_BRANCH"' "$WRAPPER"
+assert_grep "TC-CXRS-WT-SRC-02 wrapper passes the prepared workdir to _run_codex_review (4th arg)" \
+  '_run_codex_review "\$_agent_prompt".*"\$_cx_pr_workdir"' "$WRAPPER"
+assert_grep "TC-CXRS-WT-SRC-03 wrapper tears the codex worktree down" \
+  '_codex_review_cleanup_worktree "\$_cx_pr_workdir"' "$WRAPPER"
+
+# TC-CXRS-WT-SRC-04..06 — #218 review finding 1: the wrapper FAILS CLOSED when the
+# PR-branch worktree cannot be prepared. It MUST guard the `_run_codex_review` call
+# behind a `_cx_wt_ready == true` gate (never run a vote-producing review without a
+# PR-scoped worktree), and on the failure branch set the non-zero sentinel rc
+# (CODEX_REVIEW_NO_WORKTREE_RC, default 70) so the agent resolves `unavailable`
+# rather than voting on PROJECT_DIR's wrong/empty diff. Pin all three.
+assert_grep "TC-CXRS-WT-SRC-04 wrapper gates _run_codex_review behind a worktree-ready flag (fail-closed, finding 1)" \
+  '_cx_wt_ready' "$WRAPPER"
+assert_grep "TC-CXRS-WT-SRC-05 wrapper runs codex review ONLY when the worktree is ready" \
+  '\[\[ "\$_cx_wt_ready" == true \]\]' "$WRAPPER"
+assert_grep "TC-CXRS-WT-SRC-06 wrapper sets the non-zero fail-closed sentinel rc on prepare failure (→ unavailable, no vote)" \
+  '_rc="\$\{CODEX_REVIEW_NO_WORKTREE_RC:-70\}"' "$WRAPPER"
+# And the stale "fails open" wording must be GONE — the prepare-failure path no
+# longer runs from PROJECT_DIR.
+if grep -qF 'running from PROJECT_DIR (the auto-scoped diff may be wrong)' "$WRAPPER"; then
+  echo -e "  ${RED}FAIL${NC}: TC-CXRS-WT-SRC-07 stale fail-open 'running from PROJECT_DIR' path still present in wrapper"
   FAIL=$((FAIL + 1))
 else
-  echo -e "  ${GREEN}PASS${NC}: TC-CXR-XA-SRC-02 stale 'review wrapper never resumes' claim removed"
+  echo -e "  ${GREEN}PASS${NC}: TC-CXRS-WT-SRC-07 stale fail-open 'running from PROJECT_DIR' path removed (fails closed now)"
+  PASS=$((PASS + 1))
+fi
+
+# TC-CXRS-WT-SRC-08 — #218 finding 2 source-of-truth: the LIVE wrapper does NOT drop
+# an rc-0 review on a bare `[[ -n "$_cx_stdout" && -s "$_cx_stdout" ]] || continue`
+# (which dropped a clean rc-0 empty review `unavailable`). Pin its absence so a
+# regression cannot return silently.
+if grep -qE '\[\[ -n "\$_cx_stdout" && -s "\$_cx_stdout" \]\][[:space:]]*\|\|[[:space:]]*continue' "$WRAPPER"; then
+  echo -e "  ${RED}FAIL${NC}: TC-CXRS-WT-SRC-08 stale '[[ -n && -s ]] || continue' empty-capture drop still present (would drop rc-0 empty review)"
+  FAIL=$((FAIL + 1))
+else
+  echo -e "  ${GREEN}PASS${NC}: TC-CXRS-WT-SRC-08 empty-capture drop removed — rc-0 empty capture is no longer dropped (finding 2)"
+  PASS=$((PASS + 1))
+fi
+# TC-CXRS-WT-SRC-09 — #218 finding 5 source-of-truth: the rc-0 gate is the SOLE gate
+# on the stdout fallback path — the broad-substring `_codex_review_has_stream_error`
+# skip is GONE from the wrapper's fallback (it false-positived on a clean rc-0 review
+# that merely MENTIONS the stream-error phrase, dropping it `unavailable`). The
+# helper still EXISTS (used by _classify_codex_drop_reason in the lib), and the
+# wrapper may still REFERENCE it in an explanatory comment, but it must not CALL it
+# (an invocation is `_codex_review_has_stream_error "<arg>`). Assert no invocation —
+# a NON-comment line where the helper name is immediately followed by a quoted arg.
+if grep -nE '_codex_review_has_stream_error[[:space:]]+"' "$WRAPPER" | grep -vE '^[0-9]+:[[:space:]]*#'; then
+  echo -e "  ${RED}FAIL${NC}: TC-CXRS-WT-SRC-09 wrapper still CALLS _codex_review_has_stream_error to gate the rc-0 fallback (false-negative risk, finding 5)"
+  FAIL=$((FAIL + 1))
+else
+  echo -e "  ${GREEN}PASS${NC}: TC-CXRS-WT-SRC-09 stream-error skip removed from the wrapper rc-0 fallback — rc-0 gate is the sole gate (finding 5)"
   PASS=$((PASS + 1))
 fi
 
