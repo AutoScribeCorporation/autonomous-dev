@@ -54,6 +54,11 @@ load_autonomous_conf "${SCRIPT_DIR}" || true
 # shellcheck source=lib-dispatch.sh
 source "${LIB_DIR}/lib-dispatch.sh"
 
+# [INV-70] Observe-only metrics emitter. Guarded so a load failure never aborts
+# the tick. Provides metrics_emit.
+# shellcheck source=lib-metrics.sh
+source "${LIB_DIR}/lib-metrics.sh" 2>/dev/null || true
+
 : "${PROJECT_DIR:?PROJECT_DIR must be set in autonomous.conf}"
 
 log() { echo "[dispatcher-tick] $(date -u +%H:%M:%S) $*"; }
@@ -207,6 +212,28 @@ for i in $(seq 0 $((new_count - 1))); do
 
   log "  dispatching dev-new for issue #${issue_num}"
   label_swap "$issue_num" "" "in-progress"
+  # [INV-70] Metrics: the issue is first picked up for autonomous work — the
+  # TTHW "labeled" endpoint. Emitted only on the first (dev-new) dispatch, not
+  # on resumes/re-dispatches, so the aggregator's earliest-per-issue reduction
+  # is anchored here. Best-effort, observe-only.
+  #
+  # The event `ts` is THIS dispatch instant, which can lag the real `autonomous`
+  # label time by ticks (concurrency cap, unresolved deps). For accurate TTHW we
+  # also fetch the actual `autonomous`-label timeline timestamp and emit it as
+  # `labeled_at`; the aggregator prefers it over `ts`, so labeled→PR/merge counts
+  # the queue wait (#228 review finding 4). The timeline call is best-effort: on
+  # any failure `labeled_at` is omitted and the aggregator falls back to `ts`.
+  if declare -F metrics_emit >/dev/null 2>&1; then
+    _labeled_at="$(gh api "repos/${REPO}/issues/${issue_num}/timeline" \
+      --jq 'map(select(.event == "labeled" and .label.name == "autonomous")) | (.[0].created_at // empty)' \
+      2>/dev/null || true)"
+    if [[ -n "${_labeled_at:-}" ]]; then
+      metrics_emit issue_labeled "issue=${issue_num}" "labeled_at=${_labeled_at}" || true
+    else
+      metrics_emit issue_labeled "issue=${issue_num}" || true
+    fi
+    unset _labeled_at
+  fi
   # Bug 1+2 (#99): write a dispatcher-controlled marker that records the
   # dispatch timestamp ([INV-17]). Step 5 uses this to honor a cold-start
   # grace window before classifying the wrapper as crashed.
@@ -259,8 +286,23 @@ for i in $(seq 0 $((pd_count - 1))); do
   retry_count=$(count_retries "$issue_num")
   if [ "$retry_count" -ge "$MAX_RETRIES" ]; then
     log "  issue #${issue_num} retry exhausted ($retry_count/$MAX_RETRIES) — marking stalled"
+    # [INV-70] Metrics: retry exhausted → stalled. Best-effort, observe-only.
+    if declare -F metrics_emit >/dev/null 2>&1; then
+      metrics_emit dispatch_retry "issue=${issue_num}" "retry_count=${retry_count}" stalled=true || true
+    fi
     mark_stalled "$issue_num"
     continue
+  fi
+
+  # [INV-70] Metrics: a below-limit retry increment. Emitted ONCE here, after the
+  # exhaustion gate and before ANY of the downstream pending-dev re-dispatch
+  # branches (PR-exists handoff, PTL fresh dev-new, completed-session routing,
+  # normal dev-resume), so every retry attempt — not just the final stall — lands
+  # in the event trail with `stalled=false` (#228 review: retry history was only
+  # recorded at exhaustion). The `stalled=true` event above stays for the
+  # exhaustion case. Best-effort, observe-only.
+  if declare -F metrics_emit >/dev/null 2>&1; then
+    metrics_emit dispatch_retry "issue=${issue_num}" "retry_count=${retry_count}" stalled=false || true
   fi
 
   # Bug 3 (#99): if a PR already exists for this issue, the agent already
@@ -475,6 +517,12 @@ for i in $(seq 0 $((cand_count - 1))); do
           echo "INFO: issue ${issue_num} dev wrapper pid_alive miss but in-flight signal positive; deferring crash declaration ([INV-27])" >&2
           continue
         fi
+        # [INV-70] Metrics: dispatcher declared a dev wrapper DEAD with no PR.
+        # Class false-stall (the near-success cross-check above already cleared,
+        # so this is a real crash declaration, not a probe race). Best-effort.
+        if declare -F metrics_emit >/dev/null 2>&1; then
+          metrics_emit dispatch_stale "issue=${issue_num}" kind=in-progress failure_class=false-stall || true
+        fi
         gh issue comment "$issue_num" --repo "$REPO" \
           --body "Task appears to have crashed (no PR found). Moving to pending-dev for retry."
         label_swap "$issue_num" "in-progress" "pending-dev"
@@ -517,11 +565,25 @@ for i in $(seq 0 $((cand_count - 1))); do
         echo "INFO: issue ${issue_num} review wrapper pid_alive miss but PR-state signal positive; deferring crash declaration (#111 INV-24)" >&2
         continue
       fi
+      # [INV-70] Metrics: dispatcher declared a review wrapper DEAD. Class
+      # false-stall (the review_near_success cross-check above already cleared).
+      if declare -F metrics_emit >/dev/null 2>&1; then
+        metrics_emit dispatch_stale "issue=${issue_num}" kind=reviewing failure_class=false-stall || true
+      fi
       gh issue comment "$issue_num" --repo "$REPO" \
         --body "Review process appears to have crashed. Moving to pending-dev for retry."
       label_swap "$issue_num" "reviewing" "pending-dev"
     fi
   fi
 done
+
+# [INV-70] Retention built into the collector: prune the metrics log once per
+# tick (default 90d). The dispatcher runs on a cron cadence, so this is the
+# steady drumbeat that bounds the log even for a project whose wrappers rarely
+# run. Best-effort — metrics_prune always returns 0, so a prune failure can
+# never affect the tick. (#228 review: prune was opt-in via the report only.)
+if declare -F metrics_prune >/dev/null 2>&1; then
+  metrics_prune "${METRICS_RETENTION_DAYS:-90}" 2>/dev/null || true
+fi
 
 log "Tick complete. Dispatched: ${JUST_DISPATCHED[*]:-<none>}"

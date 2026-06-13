@@ -32,6 +32,11 @@ LIB_DIR="$(cd "$(dirname "$(readlink -f "$_SELF")")" && pwd)"
 export AUTONOMOUS_CONF_DIR="$SCRIPT_DIR"
 source "${LIB_DIR}/lib-agent.sh"
 source "${LIB_DIR}/lib-auth.sh"
+# [INV-70] Observe-only metrics emitter. Sourced from LIB_DIR (skill tree) like
+# the other libs; provides metrics_emit/metrics_dir. A failure here must never
+# abort the wrapper, so the source itself is guarded.
+# shellcheck source=lib-metrics.sh
+source "${LIB_DIR}/lib-metrics.sh" 2>/dev/null || true
 # Per-side AGENT_CMD override (INV-37). Empty-string fallback already
 # applied inside lib-agent.sh; this just rebinds AGENT_CMD so the case
 # statements in run_agent / resume_agent dispatch to the dev-side CLI.
@@ -126,6 +131,32 @@ LOG_FILE="/tmp/agent-${PROJECT_ID}-issue-${ISSUE_NUMBER}.log"
 PID_DIR=$(pid_dir_for_project) || { echo "ERROR: cannot resolve PID dir" >&2; exit 1; }
 PID_FILE="${PID_DIR}/issue-${ISSUE_NUMBER}.pid"
 AGENT_RAN=false
+
+# [INV-70] Metrics: wrapper start. Best-effort, observe-only — never affects
+# wrapper behavior. METRICS_START_TS feeds the wrapper_end duration in cleanup().
+METRICS_START_TS=$(date +%s 2>/dev/null || echo 0)
+# Byte size of the shared per-issue agent log at START. dispatch-local.sh appends
+# every dev/resume attempt for the SAME issue to one /tmp/agent-…-issue-N.log, so
+# parsing the whole file would re-read a PRIOR run's token line and emit a
+# duplicate token_usage (inflating cost-per-merged-PR; #228 review finding 2).
+# _emit_dev_end passes this offset to metrics_parse_tokens so only THIS run's
+# appended bytes are scanned. Missing/empty file → 0 (scan from the start, which
+# is correct for a first run). Best-effort; never affects behavior.
+#
+# The `-f` guard is load-bearing under `set -euo pipefail`: a bare
+# `$(wc -c < "$LOG_FILE")` on a MISSING file fails the redirection, pipefail
+# propagates the non-zero, and `set -e` would ABORT the wrapper before the agent
+# runs. In production dispatch-local.sh pre-creates the log, but a direct
+# `bash autonomous-dev.sh` invocation has no such file — so guard here rather
+# than depend on the caller (#228 round-6 review).
+METRICS_LOG_OFFSET=0
+if [[ -f "$LOG_FILE" ]]; then
+  METRICS_LOG_OFFSET=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d '[:space:]') || METRICS_LOG_OFFSET=0
+  [[ "$METRICS_LOG_OFFSET" =~ ^[0-9]+$ ]] || METRICS_LOG_OFFSET=0
+fi
+if declare -F metrics_emit >/dev/null 2>&1; then
+  metrics_emit wrapper_start side=dev "mode=${MODE}" "issue=${ISSUE_NUMBER}" "agent=${AGENT_CMD:-claude}" || true
+fi
 
 # SIGTERM-aware exit routing (INV-15, closes #67).
 # Dispatcher Step 5a SIGTERMs us when "ALIVE + PR ready". Bash exits with
@@ -401,6 +432,38 @@ POSTAPPROVAL
 cleanup() {
   local exit_code=$?
 
+  # [INV-70] Metrics: wrapper_end. Defined as a closure so both the early-return
+  # (agent-never-ran) path and the normal path emit it with the FINAL exit_code
+  # (after the SIGTERM rewrite below). Best-effort, observe-only.
+  _emit_dev_end() {
+    declare -F metrics_emit >/dev/null 2>&1 || return 0
+    local _rc="$1" _dur=0 _now
+    _now=$(date +%s 2>/dev/null || echo 0)
+    [[ "$METRICS_START_TS" -gt 0 && "$_now" -ge "$METRICS_START_TS" ]] 2>/dev/null \
+      && _dur=$((_now - METRICS_START_TS))
+    metrics_emit wrapper_end side=dev "rc=${_rc}" "duration_s=${_dur}" \
+      "issue=${ISSUE_NUMBER:-}" "agent=${AGENT_CMD:-claude}" || true
+    # Token usage from the agent log, if the CLI emitted any (claude JSON /
+    # codex line). Splice the parsed `input_tokens=.. output_tokens=..
+    # total_tokens=..` words in (the schema key names the aggregator reads).
+    # Pass METRICS_LOG_OFFSET so ONLY this run's appended bytes are scanned — the
+    # log is shared across every dev/resume attempt for the issue, so scanning the
+    # whole file would re-read a prior run's token line (#228 review finding 2).
+    local _tok
+    _tok="$(metrics_parse_tokens "${LOG_FILE:-}" "${METRICS_LOG_OFFSET:-0}" 2>/dev/null)" || true
+    if [[ -n "$_tok" ]]; then
+      # shellcheck disable=SC2086  # intentional word-split of the k=v fields
+      metrics_emit token_usage side=dev "issue=${ISSUE_NUMBER:-}" "agent=${AGENT_CMD:-claude}" $_tok || true
+    fi
+    # [INV-70] Retention is built INTO the collector: prune the metrics log once
+    # per wrapper run (here, at wrapper_end — not per emit, which would rewrite
+    # the file on every line). Default METRICS_RETENTION_DAYS (90). Best-effort:
+    # metrics_prune swallows all errors and returns 0, so a prune failure can
+    # never affect the wrapper's rc or label transitions (#228 review: prune was
+    # opt-in via the report only; normal collection never enforced retention).
+    metrics_prune "${METRICS_RETENTION_DAYS:-90}" 2>/dev/null || true
+  }
+
   # Tear down the heartbeat loop fast (parent-pid watchdog would also
   # take it down within HEARTBEAT_INTERVAL_SECONDS, but explicit is
   # cheaper). The kill is allowed to fail — the loop may already have
@@ -447,6 +510,7 @@ EOF
     else
       log "Exiting with code $exit_code (agent never ran, no ISSUE_NUMBER or gh — silent)."
     fi
+    _emit_dev_end "$exit_code"
     cleanup_github_auth
     return
   fi
@@ -530,6 +594,28 @@ EOF
       --remove-label "in-progress" \
       --add-label "pending-dev" || log "WARNING: Failed to update issue labels"
     log "Agent failed (exit $exit_code). Issue remains in pending-dev for retry."
+  fi
+
+  # [INV-70] Metrics: emit wrapper_end with the FINAL exit_code (post SIGTERM
+  # rewrite). Also emit pr_opened for TTHW when this run handed off a PR.
+  _emit_dev_end "$exit_code"
+  if declare -F metrics_emit >/dev/null 2>&1 && [[ "${PR_EXISTS:-0}" -gt 0 ]]; then
+    # The event `ts` is THIS cleanup instant, but the PR may have been opened
+    # earlier in the run (agent creates the PR before finishing tests) or on a
+    # prior run (resume hands off an already-open PR) — so `ts` OVERSTATES TTHW
+    # labeled→first-PR. Best-effort fetch the EARLIEST matching PR's real
+    # `createdAt` and emit it as `pr_opened_at`; the aggregator prefers it over
+    # `ts` (mirrors the issue_labeled→labeled_at fix). On any gh failure the
+    # field is omitted and the aggregator falls back to `ts` (#228 review).
+    _pr_created_at="$(gh pr list --repo "$REPO" --state all --json createdAt,body \
+      -q "[.[] | select(.body != null and ((.body | test(\"#${ISSUE_NUMBER}[^0-9]\")) or (.body | test(\"#${ISSUE_NUMBER}\$\"))))] | sort_by(.createdAt) | (.[0].createdAt // empty)" \
+      2>/dev/null || true)"
+    if [[ -n "${_pr_created_at:-}" ]]; then
+      metrics_emit pr_opened side=dev "issue=${ISSUE_NUMBER:-}" "pr_opened_at=${_pr_created_at}" || true
+    else
+      metrics_emit pr_opened side=dev "issue=${ISSUE_NUMBER:-}" || true
+    fi
+    unset _pr_created_at
   fi
 
   cleanup_github_auth
