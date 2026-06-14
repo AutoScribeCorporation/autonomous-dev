@@ -106,5 +106,8 @@ while true; do
     log "WARN: token mint failed; skipping clone sync this tick"
   fi
   bash "$SCRIPTS/dispatcher-tick.sh" || log "tick returned non-zero (non-fatal; will retry)"
+  # P0 DAG planner dry-run: proposes a plan on `autonomous-plan` issues, executes
+  # nothing. Isolated from the dev->review pipeline above (different label).
+  bash "$SCRIPTS/plan-tick.sh" || log "plan-tick returned non-zero (non-fatal)"
   sleep "${TICK_SECONDS:-300}"
 done
