@@ -1,0 +1,37 @@
+name: autonomous-dev
+
+# Autonomous issue->PR->review->merge loop for QuantFlowsCorporation/backend, Claude worker.
+# On the edge bridge so it can reach the France ts-exit proxy (Claude->Anthropic, HK geo-block).
+# SANDBOXED: NO docker.sock, no host tree mounts beyond the read-only App key. Auto-merge is ON
+# but gated by branch protection (required verify checks) on the target's main.
+networks:
+  edge:
+    external: true
+
+services:
+  autonomous-dev:
+    container_name: autonomous-dev
+    image: ghcr.io/autoscribecorporation/autonomous-dev:latest
+    networks: [edge]
+    environment:
+      # Claude -> Anthropic via France exit (api.anthropic.com is geo-blocked from HK).
+      HTTPS_PROXY: "http://ts-exit:1055"
+      HTTP_PROXY: "http://ts-exit:1055"
+      # GitHub + loopback go DIRECT (not geo-blocked; keep App-token + git off the proxy).
+      NO_PROXY: "api.github.com,github.com,codeload.github.com,objects.githubusercontent.com,uploads.github.com,ts-exit,localhost,127.0.0.1"
+      HOME: /root
+      TICK_SECONDS: "300"
+    volumes:
+      - autonomous_claude:/root/.claude          # subscription Claude creds (seeded from the IDE volume)
+      - autonomous_work:/work                     # target clone + per-issue worktrees
+      - /home/hugo/quantflows-app.pem:/secrets/app.pem:ro   # GitHub App key (mint 1h tokens)
+    # Deliberately NO /var/run/docker.sock — the agent cannot reach the host.
+    cap_drop: [NET_RAW, NET_ADMIN]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 6g
+    restart: unless-stopped
+
+volumes:
+  autonomous_claude:
+  autonomous_work:
