@@ -6,7 +6,7 @@ set -euo pipefail
 
 SKILLS=/opt/autonomous-dev/skills
 SCRIPTS="$SKILLS/autonomous-dispatcher/scripts"
-export AUTONOMOUS_CONF=/opt/autonomous-dev/autonomous.conf
+export AUTONOMOUS_CONF="$SCRIPTS/autonomous.conf"
 # shellcheck source=/dev/null
 source "$AUTONOMOUS_CONF"
 

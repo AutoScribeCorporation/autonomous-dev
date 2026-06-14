@@ -24,7 +24,9 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_VERSION} && npm cache clea
 
 # The pipeline (fork scripts) live here, read-only at runtime.
 COPY skills/ /opt/autonomous-dev/skills/
-COPY deploy/autonomous.conf /opt/autonomous-dev/autonomous.conf
+# autonomous.conf MUST live in the scripts dir: dispatch-local.sh (and the dev/review
+# wrappers) load it via ${SCRIPT_DIR}/autonomous.conf, NOT via $AUTONOMOUS_CONF.
+COPY deploy/autonomous.conf /opt/autonomous-dev/skills/autonomous-dispatcher/scripts/autonomous.conf
 COPY deploy/entrypoint.sh /opt/autonomous-dev/entrypoint.sh
 RUN chmod +x /opt/autonomous-dev/entrypoint.sh \
   && find /opt/autonomous-dev/skills -name '*.sh' -exec chmod +x {} +
@@ -36,7 +38,7 @@ RUN chmod +x /opt/autonomous-dev/entrypoint.sh \
 # dirs so fresh named volumes inherit node ownership on first mount.
 RUN mkdir -p /work /home/node/.claude /home/node/.config \
     && chown -R node:node /work /home/node
-ENV AUTONOMOUS_CONF=/opt/autonomous-dev/autonomous.conf \
+ENV AUTONOMOUS_CONF=/opt/autonomous-dev/skills/autonomous-dispatcher/scripts/autonomous.conf \
     HOME=/home/node
 USER node
 WORKDIR /work
