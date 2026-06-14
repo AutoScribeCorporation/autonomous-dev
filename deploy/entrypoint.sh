@@ -77,11 +77,20 @@ while true; do
   # protection blocks their merge (root cause of the #62 stall). The primary
   # worktree sits on the default branch and is never edited by agents (they work
   # in .worktrees/), so a hard reset to origin is safe.
-  if git -C "$PROJECT_DIR" fetch -q origin "$DEFAULT_BRANCH" 2>/dev/null; then
-    git -C "$PROJECT_DIR" reset --hard -q "origin/$DEFAULT_BRANCH" 2>/dev/null \
-      || log "WARN: could not fast-forward $DEFAULT_BRANCH to origin"
+  # Refresh origin auth with a FRESH App installation token first: the clone's
+  # embedded token expires after 1h, which silently breaks fetch AND the agent's
+  # push (observed on #61). Re-setting the URL every tick keeps both working.
+  _tok=$(mint_token 2>/dev/null || true)
+  if [ -n "$_tok" ]; then
+    git -C "$PROJECT_DIR" remote set-url origin "https://x-access-token:${_tok}@github.com/${REPO}.git" 2>/dev/null || true
+    if git -C "$PROJECT_DIR" fetch -q origin "$DEFAULT_BRANCH" 2>/dev/null; then
+      git -C "$PROJECT_DIR" reset --hard -q "origin/$DEFAULT_BRANCH" 2>/dev/null \
+        || log "WARN: could not fast-forward $DEFAULT_BRANCH to origin"
+    else
+      log "WARN: git fetch failed even after token refresh"
+    fi
   else
-    log "WARN: git fetch failed (continuing with current base)"
+    log "WARN: token mint failed; skipping clone sync this tick"
   fi
   bash "$SCRIPTS/dispatcher-tick.sh" || log "tick returned non-zero (non-fatal; will retry)"
   sleep "${TICK_SECONDS:-300}"
