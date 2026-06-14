@@ -42,8 +42,18 @@ ln -sfn "$SKILLS/autonomous-common/hooks" "$PROJECT_DIR/hooks"
 ln -sfn "$SCRIPTS" "$PROJECT_DIR/scripts"
 
 # --- 3. install Claude TDD hooks + create pipeline labels (idempotent, best-effort) ---
+# Keep the runtime-generated files (hooks config + symlinks) out of git so the agent
+# can never commit them into a PR against the target repo.
+for _ex in ".claude/" "hooks" "scripts"; do
+  grep -qxF "$_ex" "$PROJECT_DIR/.git/info/exclude" 2>/dev/null || echo "$_ex" >> "$PROJECT_DIR/.git/info/exclude"
+done
+# Run from INSIDE the repo with NO arg: the installer resolves project_root via
+# `git rev-parse --show-toplevel`, and the wrapper launches Claude from PROJECT_DIR
+# (so $CLAUDE_PROJECT_DIR/hooks -> the symlink above, resolving correctly).
 if [ -f "$SKILLS/autonomous-common/scripts/install-claude-hooks.sh" ]; then
-  bash "$SKILLS/autonomous-common/scripts/install-claude-hooks.sh" "$PROJECT_DIR" || log "WARN: claude hook install failed (non-fatal)"
+  ( cd "$PROJECT_DIR" && bash "$SKILLS/autonomous-common/scripts/install-claude-hooks.sh" ) \
+    && log "Claude TDD hooks installed" \
+    || log "WARN: claude hook install failed (non-fatal)"
 fi
 # setup-labels calls gh directly — give it a freshly minted App token (scoped to
 # this one command; the dispatcher loop mints its own per tick, so we do NOT export
