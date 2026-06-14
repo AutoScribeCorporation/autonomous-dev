@@ -39,8 +39,8 @@ git config --global --add safe.directory "$PROJECT_DIR"
 # Commit identity = the GitHub App bot. Without this, git falls back to
 # root@<hostname> and errors ("hostname contains invalid characters") the moment
 # a hook/agent touches git; it also gives PRs proper bot attribution.
-git config --global user.name "quantflows-autonomous-dev[bot]"
-git config --global user.email "293492157+quantflows-autonomous-dev[bot]@users.noreply.github.com"
+git config --global user.name "autoscribe-dev[bot]"
+git config --global user.email "293492157+autoscribe-dev[bot]@users.noreply.github.com"
 
 # --- 2. wire the `hooks` symlink only ---
 # We do NOT symlink `scripts` at the repo root: the target repo (backend) owns its
