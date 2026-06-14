@@ -45,7 +45,10 @@ ln -sfn "$SCRIPTS" "$PROJECT_DIR/scripts"
 if [ -f "$SKILLS/autonomous-common/scripts/install-claude-hooks.sh" ]; then
   bash "$SKILLS/autonomous-common/scripts/install-claude-hooks.sh" "$PROJECT_DIR" || log "WARN: claude hook install failed (non-fatal)"
 fi
-bash "$SCRIPTS/setup-labels.sh" "$REPO" || log "WARN: label setup failed (non-fatal)"
+# setup-labels calls gh directly — give it a freshly minted App token (scoped to
+# this one command; the dispatcher loop mints its own per tick, so we do NOT export
+# a global GH_TOKEN that would go stale after 1h).
+GH_TOKEN="$(mint_token)" bash "$SCRIPTS/setup-labels.sh" "$REPO" || log "WARN: label setup failed (non-fatal)"
 
 # --- 4. tick loop (state lives in GitHub labels; box is crash-restartable) ---
 log "claude: $(claude --version 2>/dev/null || echo MISSING) | gh: $(gh --version 2>/dev/null | head -1)"
