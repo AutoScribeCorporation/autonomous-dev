@@ -7,7 +7,7 @@ FROM node:20-bookworm-slim
 
 # Tooling the dispatcher + wrappers need: git, jq, curl, openssl (App JWT), gh CLI.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl jq ca-certificates openssl procps gnupg python3 \
+      git curl jq ca-certificates openssl procps gnupg python3 uuid-runtime \
   && mkdir -p /etc/apt/keyrings \
   && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
