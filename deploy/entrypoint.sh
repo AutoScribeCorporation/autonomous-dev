@@ -68,6 +68,19 @@ fi
 # a global GH_TOKEN that would go stale after 1h).
 GH_TOKEN="$(mint_token)" bash "$SCRIPTS/setup-labels.sh" "$REPO" || log "WARN: label setup failed (non-fatal)"
 
+# --- 3b. seed ~/.claude.json (cosmetic) ---
+# Claude's top-level config lives at $HOME/.claude.json — a SIBLING of the mounted
+# .claude/ volume, so it's absent after every recreate. Claude then restores it
+# from a backup inside the volume and logs a "config file not found" notice on
+# every invocation. Restore it once at startup from the newest backup to silence
+# that noise. (If no backup exists yet, Claude creates it on first run.)
+if [ ! -f "$HOME/.claude.json" ]; then
+  _cfg_bak=$(ls -t "$HOME"/.claude/backups/.claude.json.backup.* 2>/dev/null | head -1)
+  if [ -n "$_cfg_bak" ]; then
+    cp "$_cfg_bak" "$HOME/.claude.json" && log "seeded ~/.claude.json from backup ($(basename "$_cfg_bak"))"
+  fi
+fi
+
 # --- 4. tick loop (state lives in GitHub labels; box is crash-restartable) ---
 log "claude: $(claude --version 2>/dev/null || echo MISSING) | gh: $(gh --version 2>/dev/null | head -1)"
 log "entering dispatch loop (every ${TICK_SECONDS:-300}s); auto-merge ON, gated by branch protection"
