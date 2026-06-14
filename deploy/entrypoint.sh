@@ -42,9 +42,12 @@ git config --global --add safe.directory "$PROJECT_DIR"
 git config --global user.name "quantflows-autonomous-dev[bot]"
 git config --global user.email "293492157+quantflows-autonomous-dev[bot]@users.noreply.github.com"
 
-# --- 2. wire zxkane's project-side symlinks (hooks + scripts) ---
+# --- 2. wire the `hooks` symlink only ---
+# We do NOT symlink `scripts` at the repo root: the target repo (backend) owns its
+# own scripts/ dir, so the toolkit's spawn sites were patched to use LIB_DIR (the
+# real /opt scripts dir) instead of $PROJECT_DIR/scripts. `hooks` is safe to symlink
+# (backend has no hooks/ dir) and is needed by the Claude TDD hooks ($CLAUDE_PROJECT_DIR/hooks).
 ln -sfn "$SKILLS/autonomous-common/hooks" "$PROJECT_DIR/hooks"
-ln -sfn "$SCRIPTS" "$PROJECT_DIR/scripts"
 
 # --- 3. install Claude TDD hooks + create pipeline labels (idempotent, best-effort) ---
 # Keep the runtime-generated files (hooks config + symlinks) out of git so the agent

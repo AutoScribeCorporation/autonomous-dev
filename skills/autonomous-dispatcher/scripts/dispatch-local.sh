@@ -287,7 +287,7 @@ fi
 
 case "$TYPE" in
   dev-new)
-    nohup "${PROJECT_DIR}/scripts/autonomous-dev.sh" \
+    nohup "${LIB_DIR}/autonomous-dev.sh" \
       --issue "$ISSUE_NUM" --mode new \
       >> "/tmp/agent-${PROJECT_ID}-issue-${ISSUE_NUM}.log" 2>&1 &
     CHILD_PID=$!
@@ -300,12 +300,12 @@ case "$TYPE" in
     # --session, so omitting the flag here is the canonical handoff. (#107)
     resume_args=(--issue "$ISSUE_NUM" --mode resume)
     [[ -n "$SESSION_ID" ]] && resume_args+=(--session "$SESSION_ID")
-    nohup "${PROJECT_DIR}/scripts/autonomous-dev.sh" "${resume_args[@]}" \
+    nohup "${LIB_DIR}/autonomous-dev.sh" "${resume_args[@]}" \
       >> "/tmp/agent-${PROJECT_ID}-issue-${ISSUE_NUM}.log" 2>&1 &
     CHILD_PID=$!
     ;;
   review)
-    nohup "${PROJECT_DIR}/scripts/autonomous-review.sh" \
+    nohup "${LIB_DIR}/autonomous-review.sh" \
       --issue "$ISSUE_NUM" \
       >> "/tmp/agent-${PROJECT_ID}-review-${ISSUE_NUM}.log" 2>&1 &
     CHILD_PID=$!

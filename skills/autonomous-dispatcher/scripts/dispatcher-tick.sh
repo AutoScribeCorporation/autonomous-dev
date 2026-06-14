@@ -137,7 +137,10 @@ fi
 dispatch() {
   case "${EXECUTION_BACKEND:-local}" in
     local)
-      bash "$PROJECT_DIR/scripts/dispatch-local.sh" "$@"
+      # Fork change: invoke from the REAL toolkit dir (LIB_DIR), not the project-side
+      # $PROJECT_DIR/scripts symlink — the target repo (backend) owns its own scripts/,
+      # so that symlink convention collides. Mirrors the remote-aws-ssm branch below.
+      bash "$LIB_DIR/dispatch-local.sh" "$@"
       ;;
     remote-aws-ssm)
       # [INV-65] Invoke the remote driver via LIB_DIR (the real skill tree),
