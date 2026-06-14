@@ -24,7 +24,8 @@ services:
     volumes:
       - autonomous_claude:/home/node/.claude     # subscription Claude creds (seeded from the IDE volume; uid 1000)
       - autonomous_work:/work                     # target clone + per-issue worktrees
-      - /home/hugo/quantflows-app.pem:/secrets/app.pem:ro   # GitHub App key (mint 1h tokens)
+      - /home/hugo/quantflows-app.pem:/secrets/app.pem:ro            # dev + dispatcher App key
+      - /home/hugo/quantflows-reviewer-app.pem:/secrets/reviewer-app.pem:ro  # reviewer App key (distinct identity)
     # Deliberately NO /var/run/docker.sock — the agent cannot reach the host.
     cap_drop: [NET_RAW, NET_ADMIN]
     security_opt:
