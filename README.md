@@ -406,6 +406,9 @@ The dispatcher is an [OpenClaw](https://github.com/OpenClaw/OpenClaw) skill that
 | Cursor Agent | `agent` | `-p "<prompt>"` | `--resume=<chat-id>` | Generic fallback (untested explicit branch) |
 | Gemini CLI | `gemini` | `--session-id <UUID> -p "<prompt>"` | `--resume <UUID>` | Full support |
 | opencode | `opencode` | `run --format json [PROMPT]` | `run --session <sessionID>` (captured from JSON stream) | Full support † |
+| Kimi Code | `kimi` | `--print --session <UUID>` (prompt via stdin) | same `--session <UUID>` (id round-trips, no sidecar) | Full support ‡ (AutoScribeCorporation fork) |
+
+‡ **Kimi prerequisites (fork addition — see the "kimi block" in `autonomous.conf.example`).** Kimi Code CLI (Moonshot) is gemini-style: a caller-minted `--session <UUID>` is reused verbatim to resume (Kimi creates the session if the id is new). Set `AGENT_DEV_EXTRA_ARGS="--yolo --output-format stream-json"` (auto-approve + heartbeat liveness; both load-bearing, both operator-tunable — the wrapper hardcodes neither). **Headless auth:** put the API key in `~/.kimi/config.toml` (rendered from a SOPS secret at deploy), pin the CLI version, and set `KIMI_CODE_NO_AUTO_UPDATE=1`. Kimi is mid Python→TS migration and its docs disagree on `--yolo` vs `--afk` and on env-var-vs-config auth — **lab-verify both against your pinned build in a clean non-interactive shell before unattended runs.**
 
 † **opencode prerequisites.** Unlike Claude Code (Anthropic-bound) or Codex CLI (OpenAI-bound), opencode is provider-agnostic — it has no default model, and no built-in credentials. Before setting `AGENT_CMD=opencode`:
 

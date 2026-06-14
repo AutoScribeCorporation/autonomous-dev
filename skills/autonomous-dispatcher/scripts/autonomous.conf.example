@@ -478,6 +478,30 @@ AGENT_REVIEW_EXTRA_ARGS=""
 # AGENT_DEV_EXTRA_ARGS="--approval-mode yolo --output-format stream-json"
 # AGENT_REVIEW_EXTRA_ARGS="--approval-mode yolo --output-format stream-json"
 
+# --- kimi block (AutoScribeCorporation fork) ---
+# Kimi Code CLI (Moonshot). Gemini-style: --print + caller-minted --session
+# <uuid> are STRUCTURAL (hardcoded in lib-agent.sh); both EXTRA_ARGS values
+# below are LOAD-BEARING and operator-tunable:
+#   --yolo               auto-approve tool calls. Kimi's docs disagree across
+#                        versions (--yolo vs --afk); VERIFY against your pinned
+#                        CLI build in the lab spike and correct here — no code
+#                        change needed. Without it, headless Kimi denies tools
+#                        and can fabricate success (the #102 failure mode).
+#   --output-format stream-json   per-event JSONL for heartbeat liveness (the
+#                        bare end-of-run blob defeats it — same as gemini #134).
+#
+# HEADLESS AUTH (cron): write the API key into ~/.kimi/config.toml (rendered
+# from a SOPS secret at deploy) — Kimi's env-var vs config.toml precedence is
+# version-dependent and self-contradictory in its docs; lab-verify in a clean
+# NON-interactive shell with NO credential env vars before trusting cron.
+# Pin the CLI version and set KIMI_CODE_NO_AUTO_UPDATE=1 so cron can't drift.
+#
+# AGENT_CMD="kimi"
+# AGENT_DEV_MODEL="kimi-k2.6"
+# AGENT_REVIEW_MODEL="kimi-k2.6"
+# AGENT_DEV_EXTRA_ARGS="--yolo --output-format stream-json"
+# AGENT_REVIEW_EXTRA_ARGS="--yolo --output-format stream-json"
+
 # --- kiro block ---
 # --trust-all-tools is LOAD-BEARING on stock kiro installs (closes #136):
 # the default kiro agent's allowedTools denies every coding tool in

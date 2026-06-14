@@ -823,6 +823,37 @@ run_agent() {
         "${extra_args[@]}" \
         -p
       ;;
+    kimi)
+      # Kimi Code CLI (Moonshot). Gemini-style caller-minted session id:
+      # `--session <UUID>` round-trips, and Kimi creates the session if the id
+      # does not yet exist — so passing the SAME id on a later run resumes it,
+      # with no sidecar capture (resume_agent uses the identical invocation).
+      # Verified 2026-06; Kimi is mid Python->TS migration — re-verify flags +
+      # headless auth (config.toml vs shell env) on every CLI version bump and
+      # pin the version (KIMI_CODE_NO_AUTO_UPDATE=1).
+      #
+      # Structural flags (NOT operator-tunable):
+      #   --print                  headless mode; reads the prompt from stdin
+      #                            (INV-34 stdin channel, like every other CLI).
+      #   --session "$session_id"  caller-minted UUID; new-or-resume by id.
+      #
+      # Operator-tunable flags live in AGENT_DEV_EXTRA_ARGS / AGENT_REVIEW_EXTRA_ARGS
+      # (post-#140 contract; mirrors gemini — the wrapper hardcodes NEITHER the
+      # auto-approve flag NOR --output-format stream-json). Canonical values in
+      # autonomous.conf "kimi block":
+      #   --yolo                       auto-approve tool calls (Kimi's docs vary:
+      #                                --yolo vs --afk by version — lab-verify the
+      #                                pinned build; EXTRA_ARGS makes it a conf fix,
+      #                                not a code change). Without it headless Kimi
+      #                                denies tools and can fabricate success (#102).
+      #   --output-format stream-json  per-event JSONL for heartbeat liveness
+      #                                (single-blob json defeats it — gemini #134).
+      printf '%s' "$prompt" | _run_with_timeout "$AGENT_CMD" \
+        --print \
+        --session "$session_id" \
+        ${model:+--model "$model"} \
+        "${extra_args[@]}"
+      ;;
     kiro)
       # Kiro CLI does not support named sessions (session_id is ignored).
       # Each invocation starts a new conversation in the current directory.
@@ -1022,6 +1053,19 @@ resume_agent() {
         ${model:+--model "$model"} \
         "${extra_args[@]}" \
         -p
+      ;;
+    kimi)
+      # Same invocation as run_agent: a caller-minted --session id that already
+      # exists IS the resume (Kimi replays its history); if the original run
+      # never happened the session is created fresh and the full prompt (with
+      # review findings) is treated as new instructions. No --continue/--resume
+      # flag ambiguity, no sidecar — the id round-trip carries the state.
+      # Operator-tunable flags via AGENT_REVIEW_EXTRA_ARGS (same contract as run).
+      printf '%s' "$prompt" | _run_with_timeout "$AGENT_CMD" \
+        --print \
+        --session "$session_id" \
+        ${model:+--model "$model"} \
+        "${extra_args[@]}"
       ;;
     kiro)
       # Kiro CLI --resume cannot inject new review feedback effectively —
