@@ -72,6 +72,17 @@ GH_TOKEN="$(mint_token)" bash "$SCRIPTS/setup-labels.sh" "$REPO" || log "WARN: l
 log "claude: $(claude --version 2>/dev/null || echo MISSING) | gh: $(gh --version 2>/dev/null | head -1)"
 log "entering dispatch loop (every ${TICK_SECONDS:-300}s); auto-merge ON, gated by branch protection"
 while true; do
+  # Keep the base clone current so every new worktree branches off the LATEST
+  # origin/<default> — otherwise sequential PRs fall BEHIND and strict branch
+  # protection blocks their merge (root cause of the #62 stall). The primary
+  # worktree sits on the default branch and is never edited by agents (they work
+  # in .worktrees/), so a hard reset to origin is safe.
+  if git -C "$PROJECT_DIR" fetch -q origin "$DEFAULT_BRANCH" 2>/dev/null; then
+    git -C "$PROJECT_DIR" reset --hard -q "origin/$DEFAULT_BRANCH" 2>/dev/null \
+      || log "WARN: could not fast-forward $DEFAULT_BRANCH to origin"
+  else
+    log "WARN: git fetch failed (continuing with current base)"
+  fi
   bash "$SCRIPTS/dispatcher-tick.sh" || log "tick returned non-zero (non-fatal; will retry)"
   sleep "${TICK_SECONDS:-300}"
 done

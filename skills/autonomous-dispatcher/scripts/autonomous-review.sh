@@ -2454,6 +2454,28 @@ if [[ "$PASSED_VERDICT" == "true" ]]; then
 
     log "Issue #${ISSUE_NUMBER} marked as approved. Awaiting manual merge."
   else
+    # Fork addition: only merge when GitHub reports the PR truly mergeable (CLEAN).
+    # The INV-44 gate above checks `mergeable` (content-conflict) but NOT
+    # `mergeStateStatus`, so a PR that is MERGEABLE-but-BEHIND base (strict branch
+    # protection requires up-to-date) would reach `gh pr merge` and fail, then
+    # dead-end in pending-dev because the completed dev session can't be resumed
+    # to rebase. Instead: if BEHIND, update the branch (merge base in) so CI
+    # re-runs; for any non-CLEAN state, re-queue for the next review pass rather
+    # than attempting a doomed merge. The base-clone sync in entrypoint.sh makes
+    # this path rare (only when another PR merges during this one's lifetime).
+    PR_MERGE_STATE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus --jq '.mergeStateStatus' 2>/dev/null || echo "")
+    if [[ "$PR_MERGE_STATE" != "CLEAN" ]]; then
+      if [[ "$PR_MERGE_STATE" == "BEHIND" ]]; then
+        log "PR #${PR_NUMBER} is BEHIND ${DEFAULT_BRANCH:-main} — updating branch (CI will re-run)."
+        gh pr update-branch "$PR_NUMBER" --repo "$REPO" 2>&1 | head -3 || log "WARN: update-branch failed for PR #${PR_NUMBER}"
+      fi
+      log "PR #${PR_NUMBER} not mergeable yet (mergeState=${PR_MERGE_STATE:-empty}) — re-queueing for next review pass."
+      gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
+        --body "PR #${PR_NUMBER} not ready to merge (state: \`${PR_MERGE_STATE:-unknown}\`). $([ "$PR_MERGE_STATE" = BEHIND ] && echo "Updated the branch onto \`${DEFAULT_BRANCH:-main}\`; " )Will merge on the next review pass once checks are green." 2>/dev/null || true
+      gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
+        --remove-label "reviewing" --add-label "pending-review" 2>/dev/null || true
+      exit 0
+    fi
     log "Merging PR #${PR_NUMBER}..."
 
     # Capture merge stdout+stderr so the failure-path PR comment can
