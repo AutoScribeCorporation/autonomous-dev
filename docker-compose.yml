@@ -19,10 +19,10 @@ services:
       HTTP_PROXY: "http://ts-exit:1055"
       # GitHub + loopback go DIRECT (not geo-blocked; keep App-token + git off the proxy).
       NO_PROXY: "api.github.com,github.com,codeload.github.com,objects.githubusercontent.com,uploads.github.com,ts-exit,localhost,127.0.0.1"
-      HOME: /root
+      HOME: /home/node     # container runs as non-root `node` (uid 1000) — Claude rejects bypass as root
       TICK_SECONDS: "60"   # ~1-min pickup; ~8% of the App's 5,000/hr REST budget
     volumes:
-      - autonomous_claude:/root/.claude          # subscription Claude creds (seeded from the IDE volume)
+      - autonomous_claude:/home/node/.claude     # subscription Claude creds (seeded from the IDE volume; uid 1000)
       - autonomous_work:/work                     # target clone + per-issue worktrees
       - /home/hugo/quantflows-app.pem:/secrets/app.pem:ro   # GitHub App key (mint 1h tokens)
     # Deliberately NO /var/run/docker.sock — the agent cannot reach the host.

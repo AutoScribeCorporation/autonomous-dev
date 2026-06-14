@@ -29,7 +29,15 @@ COPY deploy/entrypoint.sh /opt/autonomous-dev/entrypoint.sh
 RUN chmod +x /opt/autonomous-dev/entrypoint.sh \
   && find /opt/autonomous-dev/skills -name '*.sh' -exec chmod +x {} +
 
+# Run as non-root (the base image's `node` user, uid 1000). REQUIRED: Claude Code
+# refuses --dangerously-skip-permissions / bypassPermissions when running as root.
+# uid 1000 also matches the IDE's `coder` user, so the seeded subscription creds
+# (owned by 1000) are already readable/writable here. Pre-create + own the runtime
+# dirs so fresh named volumes inherit node ownership on first mount.
+RUN mkdir -p /work /home/node/.claude /home/node/.config \
+    && chown -R node:node /work /home/node
 ENV AUTONOMOUS_CONF=/opt/autonomous-dev/autonomous.conf \
-    HOME=/root
+    HOME=/home/node
+USER node
 WORKDIR /work
 ENTRYPOINT ["/opt/autonomous-dev/entrypoint.sh"]
